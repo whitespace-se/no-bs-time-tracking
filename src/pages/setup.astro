@@ -1,0 +1,418 @@
+---
+/**
+ * First run.
+ *
+ * Three steps, but the step is derived from what is actually true of the instance rather
+ * than carried in the URL: no data means step one, a sync in flight means step two, data but
+ * no password means step three. A refresh, a back button or a closed laptop therefore cannot
+ * land anyone on a step that no longer matches reality.
+ */
+import '../styles/tokens.css';
+import '../styles/base.css';
+import '../styles/app.css';
+import { db, rows as sqlRows } from '../lib/db/index.ts';
+import { readCredentials, tokenKeySource } from '../lib/harvest/credentials.ts';
+import { currentSync, isSyncRunning } from '../lib/harvest/sync.ts';
+import ImportProgress from '../components/ImportProgress.astro';
+import UploadProgress from '../components/UploadProgress.astro';
+import { hasImportedData } from '../lib/setup.ts';
+import { formatCount } from '../lib/format.ts';
+import { readSettings } from '../lib/settings.ts';
+
+const database = db();
+const sync = currentSync();
+const running = isSyncRunning();
+const imported = hasImportedData(database);
+const settings = readSettings(database);
+const stored = readCredentials(database);
+const error = Astro.url.searchParams.get('error');
+
+// Derived, never stored: a sync in flight is step two, data on disk is step three, and an
+// empty database is step one — including after a failed first attempt, which lands back on
+// the form with the reason rather than on a dead progress screen.
+const step: 1 | 2 | 3 = running ? 2 : imported ? 3 : 1;
+const failure = !running && sync?.phase === 'failed' ? sync.error : null;
+const report = sync?.report ?? null;
+
+const people = step === 3
+  ? sqlRows<{ id: number; name: string; email: string; role: string }>(
+      database
+        .prepare(
+          `SELECT id, TRIM(first_name || ' ' || last_name) AS name, email, role
+             FROM users WHERE is_active = 1 ORDER BY role = 'admin' DESC, first_name, last_name`,
+        )
+        .all(),
+    )
+  : [];
+
+---
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Set up · No BS Time Tracking</title>
+    <script is:inline>document.documentElement.classList.remove('no-js');</script>
+  </head>
+  <body>
+    <main class="setup">
+      <header class="mb-4">
+        <p class="xs muted">No BS Time Tracking</p>
+        <h1 class="page-title">
+          {step === 1 && 'Set up your time tracker'}
+          {step === 2 && 'Importing from Harvest'}
+          {step === 3 && 'Which account is yours?'}
+        </h1>
+        {/* Only once an import is actually running. On the first screen there are three ways
+            in, one of which finishes in a single step, so a linear stepper would describe a
+            journey nobody has chosen yet. */}
+        {step > 1 && (
+          <ol class="steps" aria-label="Setup progress">
+            <li class="past">Connect</li>
+            <li aria-current={step === 2 ? 'step' : undefined} class:list={[{ past: step > 2 }]}>Import</li>
+            <li aria-current={step === 3 ? 'step' : undefined}>Sign in</li>
+          </ol>
+        )}
+      </header>
+
+      {error && <p class="alert mb-4" role="alert">{error}</p>}
+      {failure && !error && (
+        <p class="alert mb-4" role="alert">
+          The last import stopped: {failure}
+          <br />
+          <span class="xs muted">
+            Nothing is lost — every record is keyed on its Harvest id, so starting again
+            repairs a half-finished import rather than duplicating it.
+          </span>
+        </p>
+      )}
+
+      {step === 1 && (
+        <>
+          <p class="lead mb-4">
+            This instance is yours alone — one database, one organization, on one machine.
+            Start with an empty workspace, or bring your history across using an official CSV
+            export or read-only API access.
+          </p>
+
+          <details class="panel mb-4" open>
+            <summary>Start fresh</summary>
+            <form method="POST" action="/api/setup/fresh" class="stack mt-3">
+              <div>
+                <label class="small" for="company_name">Organization name</label>
+                <input class="field" id="company_name" name="company_name" required autocomplete="organization" />
+              </div>
+              <div class="row top">
+                <div class="grow">
+                  <label class="small" for="first_name">First name</label>
+                  <input class="field" id="first_name" name="first_name" required autocomplete="given-name" />
+                </div>
+                <div class="grow">
+                  <label class="small" for="last_name">Last name</label>
+                  <input class="field" id="last_name" name="last_name" autocomplete="family-name" />
+                </div>
+              </div>
+              <div>
+                <label class="small" for="email">Email</label>
+                <input class="field" id="email" name="email" type="email" required autocomplete="email" />
+              </div>
+              <div>
+                <label class="small" for="fresh_password">Password</label>
+                <input class="field" id="fresh_password" name="password" type="password" required autocomplete="new-password" />
+              </div>
+              <div>
+                <label class="small" for="fresh_confirm">Confirm password</label>
+                <input class="field" id="fresh_confirm" name="confirm" type="password" required autocomplete="new-password" />
+              </div>
+
+              {/* An import reads these from the source account. An empty workspace has nothing
+                  to read them from, and nothing else in the application changes them later. */}
+              <div class="settings-row">
+                <div>
+                  <label class="small" for="currency">Currency</label>
+                  <input class="field" id="currency" name="currency" value="EUR" required
+                         maxlength="3" pattern="[A-Za-z]{3}" autocapitalize="characters"
+                         aria-describedby="currency_hint" />
+                </div>
+                <div>
+                  <label class="small" for="week_start_day">Week starts on</label>
+                  <select class="field" id="week_start_day" name="week_start_day">
+                    <option value="1" selected>Monday</option>
+                    <option value="0">Sunday</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="small" for="number_format">Numbers</label>
+                  <select class="field" id="number_format" name="number_format">
+                    <option value="point" selected>1,234.50</option>
+                    <option value="comma">1 234,50</option>
+                  </select>
+                </div>
+              </div>
+              {/* Under the whole row, not under the first field: a hint tucked into one column
+                  makes three equal controls sit at three different heights. */}
+              <p class="xs muted" id="currency_hint">
+                A three-letter currency code, such as EUR, SEK or USD. All three can be changed
+                later in the database.
+              </p>
+
+              <div class="row"><button class="btn" type="submit">Create workspace</button></div>
+            </form>
+          </details>
+
+          <details class="panel mb-4">
+            <summary>Import a Harvest CSV export</summary>
+            <form method="POST" action="/api/setup/import-csv" enctype="multipart/form-data" class="stack mt-3" data-upload>
+              {/* Two fields rather than one taking several files: a single picker looks like it
+                  takes one file, and choosing two in it needs a modifier key nobody is told
+                  about. Both post as `csv`; the server tells the files apart by their headers. */}
+              <div>
+                <label class="small" for="time_report">Time report</label>
+                <input class="field" id="time_report" name="csv" type="file" accept=".csv,text/csv" required />
+                <p class="xs muted mt-1">
+                  <span class="mono">harvest_time_report.csv</span>. People, clients, projects and tasks
+                  are created from its rows.
+                </p>
+              </div>
+              <div>
+                <label class="small" for="invoice_report">Invoice report <span class="muted">(optional)</span></label>
+                <input class="field" id="invoice_report" name="csv" type="file" accept=".csv,text/csv" />
+                <p class="xs muted mt-1"><span class="mono">harvest_invoice_report.csv</span>. PDFs and receipts are not needed.</p>
+              </div>
+              <div class="row"><button class="btn" type="submit">Import CSV</button></div>
+              <UploadProgress />
+            </form>
+          </details>
+
+          <details class="panel mb-4">
+            <summary>Connect to the Harvest API</summary>
+          <form method="POST" action="/api/setup/connect" class="stack mt-3">
+            <div>
+              <label class="small" for="account_id">Harvest account ID</label>
+              <input class="field" id="account_id" name="account_id" required
+                     value={stored.accountId ?? ''} autocomplete="off" />
+              <p class="xs muted mt-1">
+                From <span class="mono">id.getharvest.com/developers</span> — the number shown
+                beside your account.
+              </p>
+            </div>
+
+            <div>
+              <label class="small" for="access_token">Personal access token</label>
+              <input class="field" id="access_token" name="access_token" type="password" required
+                     autocomplete="off" />
+              <p class="xs muted mt-1">
+                Create one on the same page. It has full access to your Harvest account, so it
+                is only ever sent to Harvest, and it is never written to the log.
+              </p>
+            </div>
+
+            <div>
+              <label class="small" for="contact">Contact address</label>
+              <input class="field" id="contact" name="contact" type="email" required
+                     value={stored.contact ?? ''} />
+              <p class="xs muted mt-1">
+                Harvest requires an address to identify the caller and refuses requests without
+                one.
+              </p>
+            </div>
+
+            <label class="row small gap-2">
+              <input type="checkbox" name="keep_token" value="true" checked />
+              Remember the token, so later syncs do not need it again
+            </label>
+            <p class="xs muted">
+              {tokenKeySource(database) === 'env' ? (
+                <>
+                  Encrypted with <span class="mono">SECRET_KEY</span>, which is set outside the
+                  database — a copy of the database alone does not reveal the token.
+                </>
+              ) : (
+                <>
+                  Encrypted with a key stored in this instance's database, so anyone holding a
+                  copy of that file can read the token. Set <span class="mono">SECRET_KEY</span>
+                  to keep the key out of the file.
+                </>
+              )}
+            </p>
+
+            <div class="row"><button class="btn" type="submit">Connect and import</button></div>
+          </form>
+          </details>
+        </>
+      )}
+
+      {step === 2 && sync && (
+        <>
+          <p class="lead mb-4">
+            {sync.kind === 'csv'
+              ? <>Importing the export. A large one takes under a minute.</>
+              : sync.company
+                ? <>Reading <strong>{sync.company}</strong>. This takes a few minutes — Harvest
+                   limits how fast anyone may read, so the import stays politely under it.</>
+                : <>Connecting to Harvest…</>}
+          </p>
+
+          <div class="mb-4"><ImportProgress sync={sync} /></div>
+
+        </>
+      )}
+
+      {step === 3 && (
+        <>
+          {sync?.kind === 'csv' && sync.summary && <p class="report mb-4">{sync.summary}</p>}
+          {report && (
+            <p class="report mb-4">
+              <strong>{report.reconciliation.imported_hours.toFixed(2)} hours</strong> imported
+              against <strong>{report.reconciliation.source_hours.toFixed(2)}</strong> in Harvest
+              — a difference of {report.reconciliation.difference.toFixed(2)}.
+              {report.invoices && (
+                <> Invoices total <strong>{report.invoices.imported_amount.toFixed(2)}</strong>
+                {report.invoices.matches ? ', exactly as in Harvest.' : `, out by ${report.invoices.difference.toFixed(2)}.`}</>
+              )}
+              <br />
+              <span class="xs muted">
+                {Object.entries(report.counts)
+                  .map(([entity, n]) => `${formatCount(n, settings)} ${entity.replace(/_/g, ' ')}`)
+                  .join(' · ')}
+              </span>
+            </p>
+          )}
+          <p class="lead mb-4">
+            Source systems do not export passwords, so everyone arrives without one. Claim your own
+            account to become the administrator; you can set the others up from the Team page,
+            or leave people to be invited later.
+          </p>
+
+          <form method="POST" action="/api/setup/admin" class="stack">
+            <div>
+              <label class="small" for="user_id">Your account</label>
+              <select class="field" id="user_id" name="user_id" required>
+                {people.map((p) => (
+                  <option value={p.id}>{p.name} · {p.email}</option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label class="small" for="password">Password</label>
+              <input class="field" id="password" name="password" type="password" required autocomplete="new-password" />
+            </div>
+            <div>
+              <label class="small" for="confirm">Confirm password</label>
+              <input class="field" id="confirm" name="confirm" type="password" required autocomplete="new-password" />
+            </div>
+            <div class="row"><button class="btn" type="submit">Finish setup</button></div>
+          </form>
+        </>
+      )}
+    </main>
+  </body>
+</html>
+
+<style>
+  .setup {
+    max-width: 34rem;
+    margin: var(--app-8) auto;
+    padding: 0 var(--app-4);
+  }
+  .setup :global(.stack) { gap: var(--app-4); }
+
+  /* Three equal controls, wrapping to one column on a narrow screen. */
+  .settings-row {
+    display: grid;
+    gap: var(--app-3);
+    grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr));
+  }
+  .settings-row > div { display: grid; gap: 0.25rem; align-content: start; }
+  #currency_hint { margin-top: calc(var(--app-3) * -1 + 0.25rem); }
+  .lead { font-size: var(--app-text); color: var(--color-text-soft); }
+
+  .steps {
+    display: flex;
+    gap: var(--app-3);
+    list-style: none;
+    padding: 0;
+    margin: var(--app-3) 0 0;
+    font-size: var(--app-text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text-muted);
+  }
+  .steps li { display: flex; align-items: center; gap: var(--app-2); }
+  .steps li + li::before { content: '→'; color: var(--color-text-muted); }
+  .steps li[aria-current='step'] { color: var(--color-text); font-weight: var(--font-weight-medium); }
+  .steps li.past { color: var(--color-green-evening); }
+
+  .alert {
+    padding: var(--app-3) var(--app-4);
+    border: 0;
+    border-radius: var(--app-radius);
+    background: color-mix(in srgb, var(--color-warning) 12%, transparent);
+    color: color-mix(in srgb, var(--color-warning) 80%, var(--color-ink));
+    font-size: var(--app-text-sm);
+  }
+
+  /* Three ways in, each its own card. No borders and no shadows: the card is a lighter plane
+     than the page, which is all a card has to be. */
+  .panel {
+    padding: var(--app-4) var(--app-5);
+    border: 0;
+    border-radius: var(--app-radius-lg);
+    background: var(--app-surface);
+  }
+
+  /* A chevron that turns, instead of the browser's disclosure triangle. */
+  .panel summary {
+    display: flex;
+    align-items: center;
+    gap: var(--app-3);
+    cursor: pointer;
+    font-size: var(--size-heading-s);
+    font-weight: var(--font-weight-medium);
+    letter-spacing: -0.012em;
+    list-style: none;
+  }
+  .panel summary::-webkit-details-marker { display: none; }
+  .panel summary::before {
+    content: '';
+    width: 0.5rem;
+    height: 0.5rem;
+    flex: none;
+    border-right: 2px solid var(--color-text-muted);
+    border-bottom: 2px solid var(--color-text-muted);
+    rotate: -45deg;
+    translate: 2px 0;
+    transition: rotate var(--app-ease), translate var(--app-ease);
+  }
+  .panel[open] summary::before { rotate: 45deg; translate: 0 -2px; }
+  .panel summary:hover::before { border-color: var(--color-text); }
+  .setup > header > p { color: var(--color-text); font-weight: var(--font-weight-semibold); }
+
+  .report {
+    padding: var(--app-3) var(--app-4);
+    border: 0;
+    border-radius: var(--app-radius);
+    background: color-mix(in srgb, var(--color-positive) 10%, transparent);
+    font-size: var(--app-text-sm);
+  }
+
+  .entities { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--app-2); }
+  .entities li {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: var(--app-3);
+    font-size: var(--app-text-sm);
+  }
+  .entity__label { color: var(--color-text-soft); }
+  .entity__count {
+    font-variant-numeric: tabular-nums;
+    font-weight: var(--font-weight-medium);
+    min-width: 5rem;
+    text-align: right;
+  }
+  .entity__count:empty::after { content: '—'; color: var(--color-text-muted); font-weight: 400; }
+
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.95em; }
+</style>

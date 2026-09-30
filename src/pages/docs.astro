@@ -1,0 +1,114 @@
+---
+/**
+ * The API documentation, served by this instance rather than by a website.
+ *
+ * Swagger UI reads /api/v1/openapi.json, which is generated from the same declarations the
+ * endpoints run — so this page describes the instance in front of you, at the address you
+ * reached it on, with your own company's name on it.
+ *
+ * "Try it out" works while you are signed in: the requests carry your session cookie, so the
+ * examples answer with this account's real data rather than a mock. A token is what an
+ * outside caller uses, and the page says so.
+ */
+import App from '../layouts/App.astro';
+import { db } from '../lib/db/index.ts';
+import { readSettings } from '../lib/settings.ts';
+import { RATE_LIMIT_PER_MINUTE } from '../lib/api/http.ts';
+
+const viewer = Astro.locals.user!;
+// Under Admin with the tokens that make it usable: an administrator is the one who hands an
+// integration to another system, and the only one who can create a token to try this with.
+if (viewer.role !== 'admin') return new Response('Administrators only.', { status: 403 });
+const settings = readSettings(db());
+---
+
+<App title="API reference" current="docs">
+  <p class="xs muted mb-2"><a href="/tokens">API access</a> / Reference</p>
+
+  <div class="row row--between mb-3 wrap gap-3">
+    <h1 class="page-title">API reference</h1>
+    <div class="row gap-3">
+      <a class="small" href="/tokens">Tokens</a>
+      <a class="small" href="/api/v1/openapi.json">openapi.json</a>
+    </div>
+  </div>
+
+  <p class="small prose-narrow mb-3">
+    Read-only access to this instance. Authenticate with a personal access token from{' '}
+    <a href="/tokens">the API access page</a>, sent as a bearer header. A token carries exactly
+    the permissions of the person who made it.
+  </p>
+
+  <pre class="snippet"><code>curl -H "Authorization: Bearer $TT_TOKEN" \
+  {Astro.url.origin}/api/v1/time-entries?from=2026-01-01&limit=5</code></pre>
+
+  <p class="xs muted mb-4">
+    Money is an integer in minor units, {settings.currency === 'SEK' ? 'öre' : 'cents'}, and durations
+    are integer seconds. {RATE_LIMIT_PER_MINUTE} requests a minute per token. Below, “Try it out”
+    runs against this instance as you, using your browser session.
+  </p>
+
+  <div id="swagger"></div>
+  <noscript>
+    <p class="small">
+      This page renders the specification with JavaScript. Without it, read
+      <a href="/api/v1/openapi.json">openapi.json</a> directly.
+    </p>
+  </noscript>
+</App>
+
+<link rel="stylesheet" href="/vendor/swagger-ui/swagger-ui.css" />
+<script is:inline src="/vendor/swagger-ui/swagger-ui-bundle.js"></script>
+<script is:inline>
+  // Vendored, so this runs on a machine with no route to the internet. If the file is ever
+  // missing the page says so rather than showing an empty rectangle.
+  if (typeof SwaggerUIBundle === 'undefined') {
+    document.getElementById('swagger').innerHTML =
+      '<p class="small">Swagger UI did not load. Read <a href="/api/v1/openapi.json">openapi.json</a> directly.</p>';
+  } else {
+    SwaggerUIBundle({
+      url: '/api/v1/openapi.json',
+      dom_id: '#swagger',
+      deepLinking: true,
+      docExpansion: 'list',
+      defaultModelsExpandDepth: 0,
+      tryItOutEnabled: true,
+      supportedSubmitMethods: ['get'],
+      // The spec is fetched and called on this same origin, so the session cookie rides
+      // along and "Try it out" answers as the person reading the page.
+      requestInterceptor: (request) => {
+        request.credentials = 'same-origin';
+        return request;
+      },
+    });
+  }
+</script>
+
+<style>
+  .snippet {
+    padding: var(--app-3);
+    border: var(--app-border);
+    background: var(--app-surface-sunken, var(--app-surface));
+    font-size: var(--app-text-sm);
+    overflow-x: auto;
+    margin: 0 0 var(--app-3);
+  }
+  /* Swagger UI ships its own type and colour. Pull the parts that touch the page back to
+     this app's, so the panel sits inside the page rather than replacing it. */
+  #swagger :global(.swagger-ui) { font-family: inherit; color: var(--color-text); }
+  #swagger :global(.swagger-ui .info) { margin: var(--app-4) 0; }
+  #swagger :global(.swagger-ui .info .title) { font-family: inherit; }
+  #swagger :global(.swagger-ui .scheme-container) {
+    background: transparent;
+    box-shadow: none;
+    padding: 0 0 var(--app-3);
+  }
+  /* Swagger sizes its own labels but lets rendered markdown inherit, which leaves a
+     parameter's description larger than the parameter's name. Only the descriptions inside
+     the tables are pulled back; the introduction above reads better at body size. */
+  #swagger :global(.swagger-ui .parameters-col_description .renderedMarkdown p),
+  #swagger :global(.swagger-ui .response-col_description .renderedMarkdown p) {
+    font-size: var(--app-text-sm);
+    margin: 0;
+  }
+</style>

@@ -1,0 +1,77 @@
+---
+/**
+ * How far a file upload has got, for a `<form data-upload>` this sits inside. A Harvest export
+ * can be 30 MB and more, and a plain form post shows nothing while it travels, so the page sits
+ * there looking stuck. With JavaScript the form is sent by XMLHttpRequest, the one browser API
+ * that reports upload progress, and the page then goes where the server sent it: on to the
+ * import's own progress, or back with the reason it was refused. Without JavaScript the form
+ * posts as it always did.
+ */
+---
+
+<div class="upload" data-upload-status hidden>
+  <div class="upload__bar" role="progressbar" aria-label="Upload progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+    <span class="upload__fill"></span>
+  </div>
+  <p class="xs muted mt-1" data-upload-text aria-live="polite">Uploading…</p>
+</div>
+
+<script is:inline>
+  (() => {
+    const mb = (bytes) => (bytes / 1024 / 1024).toFixed(1);
+    for (const form of document.querySelectorAll('form[data-upload]:not([data-upload-bound])')) {
+      form.dataset.uploadBound = '';
+      const status = form.querySelector('[data-upload-status]');
+      const bar = status.querySelector('[role="progressbar"]');
+      const fill = status.querySelector('.upload__fill');
+      const text = status.querySelector('[data-upload-text]');
+      const button = form.querySelector('button[type="submit"]');
+
+      form.addEventListener('submit', (event) => {
+        if (!form.checkValidity()) return;
+        event.preventDefault();
+        const request = new XMLHttpRequest();
+        request.open('POST', form.action);
+        status.hidden = false;
+        if (button) button.disabled = true;
+
+        request.upload.addEventListener('progress', (progress) => {
+          if (!progress.lengthComputable) return;
+          const share = progress.loaded / progress.total;
+          fill.style.setProperty('--bar-fill', `${(share * 100).toFixed(1)}%`);
+          bar.setAttribute('aria-valuenow', String(Math.round(share * 100)));
+          text.textContent = share < 1
+            ? `Uploading ${mb(progress.loaded)} of ${mb(progress.total)} MB`
+            : 'Uploaded. Starting the import…';
+        });
+        // The server answers with a redirect, which XMLHttpRequest follows; its final address
+        // is where a plain form post would have landed.
+        request.addEventListener('load', () => { window.location.href = request.responseURL || form.action; });
+        request.addEventListener('error', () => {
+          text.textContent = 'The upload failed. Check the connection and try again.';
+          if (button) button.disabled = false;
+        });
+        request.send(new FormData(form));
+      });
+    }
+  })();
+</script>
+
+<style>
+  .upload__bar {
+    position: relative;
+    height: 0.4rem;
+    overflow: hidden;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--color-text) 10%, transparent);
+  }
+  .upload__fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    /* Set from the upload's own progress as --bar-fill; the shape stays here. */
+    width: var(--bar-fill, 0%);
+    border-radius: inherit;
+    background: var(--color-accent);
+    transition: width 0.2s ease;
+  }
+</style>

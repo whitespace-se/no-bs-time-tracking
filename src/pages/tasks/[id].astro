@@ -1,0 +1,179 @@
+---
+import App from '../../layouts/App.astro';
+import { actions } from 'astro:actions';
+import { db, fromMinorUnits, row as sqlRow, rows as sqlRows } from '../../lib/db/index.ts';
+import { formatDuration } from '../../lib/format.ts';
+
+const user = Astro.locals.user!;
+if (user.role !== 'admin') return new Response('Administrators only.', { status: 403 });
+
+const saved = Astro.getActionResult(actions.saveTask);
+if (saved && !saved.error) return Astro.redirect(`/tasks/${saved.data.id}`, 303);
+
+const param = Astro.params.id ?? '';
+const isNew = param === 'new';
+const taskId = isNew ? 0 : Number(param);
+if (!isNew && (!Number.isInteger(taskId) || taskId <= 0)) return new Response('Not found', { status: 404 });
+
+const database = db();
+
+interface TaskRecord {
+  id: number;
+  name: string;
+  billable_by_default: number;
+  default_hourly_rate: number | null;
+  is_active: number;
+}
+
+const task = isNew
+  ? null
+  : sqlRow<TaskRecord>(
+      database
+        .prepare('SELECT id, name, billable_by_default, default_hourly_rate, is_active FROM tasks WHERE id = ?')
+        .get(taskId),
+    );
+if (!isNew && !task) return new Response('Not found', { status: 404 });
+
+// Where this task is actually used, and whether it bills there — billability lives on the
+// project↔task pair, so the same task can bill on one project and not another.
+const usage = isNew
+  ? []
+  : sqlRows<{ id: number; name: string; code: string | null; client_name: string; billable: number; live: number; seconds: number }>(
+      database
+        .prepare(
+          `SELECT p.id, p.name, p.code, c.name AS client_name, ta.billable,
+                  (ta.is_active AND p.is_active) AS live,
+                  COALESCE((SELECT SUM(duration_seconds) FROM time_entries
+                             WHERE project_id = p.id AND task_id = ?), 0) AS seconds
+             FROM task_assignments ta
+             JOIN projects p ON p.id = ta.project_id
+             JOIN clients c ON c.id = p.client_id
+            WHERE ta.task_id = ?
+         ORDER BY live DESC, seconds DESC, c.name, p.name
+            LIMIT 100`,
+        )
+        .all(taskId, taskId),
+    );
+
+/**
+ * Totals come from SQL, not from the list above.
+ *
+ * That list stops at 100 projects, so counting it says "100 active" for any task used more
+ * widely than that, and sums only the first hundred projects' hours. A total that silently
+ * means "of what fits on the page" is worse than no total.
+ */
+const summary = sqlRow<{ projects: number; live: number; seconds: number }>(
+  database
+    .prepare(
+      `SELECT COUNT(*) AS projects,
+              COALESCE(SUM(CASE WHEN ta.is_active = 1 AND p.is_active = 1 THEN 1 ELSE 0 END), 0) AS live,
+              (SELECT COALESCE(SUM(duration_seconds), 0) FROM time_entries WHERE task_id = ?) AS seconds
+         FROM task_assignments ta
+         JOIN projects p ON p.id = ta.project_id
+        WHERE ta.task_id = ?`,
+    )
+    .get(taskId, taskId),
+) ?? { projects: 0, live: 0, seconds: 0 };
+
+const total = summary.seconds;
+---
+
+<App title={isNew ? 'New task' : task!.name} current="tasks">
+  <p class="xs muted mb-2">
+    <a href="/tasks">Tasks</a> / {isNew ? 'New' : task!.name}
+  </p>
+
+  <h1 class="page-title mb-4">
+    {isNew ? 'New task' : task!.name}
+  </h1>
+
+  <div class="detail-grid">
+    <section>
+      <form method="POST" action={actions.saveTask} class="stack">
+        {!isNew && <input type="hidden" name="id" value={task!.id} />}
+        <div>
+          <label class="small" for="name">Name</label>
+          <input class="field" id="name" name="name" required value={task?.name ?? ''} />
+        </div>
+        <div>
+          <label class="small" for="rate">Default hourly rate</label>
+          <input class="field w-sm" id="rate" name="default_hourly_rate" inputmode="decimal"
+                 value={task?.default_hourly_rate ? String(fromMinorUnits(task.default_hourly_rate)) : ''} />
+        </div>
+        <label class="row small gap-2">
+          <input type="checkbox" name="billable_by_default" value="true"
+                 checked={task ? Boolean(task.billable_by_default) : true} />
+          Billable by default
+        </label>
+        <p class="xs muted">
+          Only a default. Each project decides whether this task bills there.
+        </p>
+        <label class="row small gap-2">
+          <input type="checkbox" name="is_active" value="true" checked={task ? Boolean(task.is_active) : true} />
+          Active
+        </label>
+        <div class="row">
+          <button class="btn" type="submit">{isNew ? 'Create task' : 'Save task'}</button>
+          <a class="btn btn--secondary" href="/tasks">Cancel</a>
+        </div>
+      </form>
+    </section>
+
+    {!isNew && (
+      <section>
+        <h2 class="detail-head">
+          Used on <span class="muted small">
+            ({summary.live} active{summary.projects > summary.live
+              ? `, ${summary.projects - summary.live} archived`
+              : ''} · {formatDuration(total)})
+          </span>
+        </h2>
+        {summary.projects > usage.length && (
+          <p class="xs muted mb-2">
+            Showing the {usage.length} projects with the most time on this task, of
+            {' '}{summary.projects}.
+          </p>
+        )}
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th scope="col">Project</th>
+                <th scope="col">Client</th>
+                <th scope="col" class="num">Hours</th>
+                <th scope="col">Bills here</th>
+              </tr>
+            </thead>
+            <tbody>
+              {usage.length === 0 && (
+                <tr><td colspan="4" class="muted empty--sm">
+                  Not assigned to any project.
+                </td></tr>
+              )}
+              {usage.map((u) => (
+                <tr class:list={[{ 'is-locked': !u.live }]}>
+                  <td><a href={`/projects/${u.id}`}>{u.code && <span class="muted">[{u.code}] </span>}{u.name}</a></td>
+                  <td class="small muted">{u.client_name}</td>
+                  <td class="num">{u.seconds ? formatDuration(u.seconds) : <span class="is-zero">0</span>}</td>
+                  <td class="xs">
+                    {!u.live
+                      ? <span class="badge badge--locked">archived</span>
+                      : u.billable
+                        ? <span class="badge badge--billable">billable</span>
+                        : <span class="muted">no</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
+    )}
+  </div>
+</App>
+
+<style>
+  .detail-grid { display: grid; grid-template-columns: 1fr; gap: var(--app-5); }
+  @media (min-width: 64em) { .detail-grid { grid-template-columns: 22rem 1fr; } }
+  .detail-head { font-size: var(--size-heading-s); font-weight: var(--font-weight-medium); margin-bottom: var(--app-2); }
+</style>

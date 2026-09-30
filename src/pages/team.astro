@@ -1,0 +1,115 @@
+---
+import App from '../layouts/App.astro';
+import { db, fromMinorUnits, rows as sqlRows } from '../lib/db/index.ts';
+import { paginate, readPageParams } from '../lib/paginate.ts';
+import Pagination from '../components/Pagination.astro';
+import { formatCount, formatDuration, startOfWeek, todayIso } from '../lib/format.ts';
+import { readSettings } from '../lib/settings.ts';
+
+const settings = readSettings(db());
+
+const user = Astro.locals.user!;
+const isAdmin = user.role === 'admin';
+const showArchived = Astro.url.searchParams.get('archived') === '1';
+const week = startOfWeek(todayIso(), settings.weekStartDay);
+
+interface TeamRow {
+  id: number;
+  email: string;
+  first_name: string;
+  last_name: string;
+  role: 'admin' | 'manager' | 'member';
+  is_active: number;
+  weekly_capacity_seconds: number | null;
+  default_billable_rate: number | null;
+  cost_rate: number | null;
+  has_password: number;
+  seconds: number;
+  last_entry: string | null;
+}
+
+const { page: pageNo, perPage } = readPageParams(Astro.url);
+const total = (db().prepare(`SELECT COUNT(*) n FROM users u WHERE (? = 1 OR u.is_active = 1)`).get(showArchived ? 1 : 0) as { n: number }).n;
+const pageInfo = paginate(total, pageNo, perPage);
+
+const team = sqlRows<TeamRow>(
+  db()
+    .prepare(
+      `SELECT u.id, u.email, u.first_name, u.last_name, u.role, u.is_active,
+              u.weekly_capacity_seconds, u.default_billable_rate, u.cost_rate,
+              CASE WHEN u.password_hash IS NULL THEN 0 ELSE 1 END AS has_password,
+              COALESCE(SUM(te.duration_seconds), 0) AS seconds,
+              MAX(te.spent_date) AS last_entry
+         FROM users u
+    LEFT JOIN time_entries te ON te.user_id = u.id
+        WHERE (? = 1 OR u.is_active = 1)
+     GROUP BY u.id
+     ORDER BY u.is_active DESC, u.first_name, u.last_name
+        LIMIT ? OFFSET ?`,
+    )
+    .all(showArchived ? 1 : 0, pageInfo.perPage, pageInfo.offset),
+);
+
+---
+
+<App title="Team" current="team">
+  <div class="row row--between mb-4">
+    <h1 class="page-title">
+      Team <span class="muted small">({formatCount(pageInfo.total, settings)})</span>
+    </h1>
+    <div class="row">
+      <a class="small" href={showArchived ? '/team' : '/team?archived=1'}>
+        {showArchived ? 'Hide inactive' : 'Show inactive'}
+      </a>
+      {isAdmin && <a class="btn" href="/team/new">Add person</a>}
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th scope="col">Name</th>
+          <th scope="col">Email</th>
+          <th scope="col">Role</th>
+          <th scope="col" class="num">Capacity</th>
+          <th scope="col" class="num">Hours</th>
+          <th scope="col">Last entry</th>
+          <th scope="col">Sign-in</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {team.map((t) => (
+          <tr class:list={[{ 'is-locked': !t.is_active }]}>
+            <td class="medium">
+              <a href={`/team/${t.id}`}>{`${t.first_name} ${t.last_name}`.trim() || t.email}</a>
+            </td>
+            <td class="small muted">{t.email}</td>
+            <td class="xs">{t.role === 'member' ? <span class="muted">member</span> : <span class="badge">{t.role}</span>}</td>
+            <td class="num small">{t.weekly_capacity_seconds ? formatDuration(t.weekly_capacity_seconds) : '—'}</td>
+            <td class="num">{formatDuration(t.seconds)}</td>
+            <td class="xs muted">{t.last_entry ?? '—'}</td>
+            <td class="xs">
+              {t.has_password
+                ? <span class="muted">set</span>
+                : <span class="badge badge--locked">no password</span>}
+            </td>
+            <td class="num small">
+              <a href={`/week/${week}/${t.id}`}>Timesheet</a>
+              {isAdmin && <> · <a href={`/team/${t.id}`}>Edit</a></>}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <Pagination page={pageInfo} url={Astro.url} label="people" />
+
+  <p class="xs muted mt-2">
+    Imported accounts arrive without a password — they can’t sign in until one is set.
+  </p>
+
+
+</App>

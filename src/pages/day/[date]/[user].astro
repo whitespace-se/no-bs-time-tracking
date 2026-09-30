@@ -1,0 +1,463 @@
+---
+import App from '../../../layouts/App.astro';
+import { canViewTimesheet } from '../../../lib/auth/session.ts';
+import { db, rows as sqlRows } from '../../../lib/db/index.ts';
+import { getWeek, dayEntries, listUsers } from '../../../lib/timesheet/week.ts';
+import { projectOptions, taskOptions, tasksByProject } from '../../../lib/timesheet/pickers.ts';
+import {
+  addDays,
+  dayLong,
+  dayMonth,
+  dayShort,
+  formatCell,
+  formatDuration,
+  isWeekend,
+  startOfWeek,
+  todayIso,
+} from '../../../lib/format.ts';
+import { readSettings } from '../../../lib/settings.ts';
+
+const { date, user } = Astro.params;
+const userId = Number(user);
+
+if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isInteger(userId)) {
+  return new Response('Not found', { status: 404 });
+}
+
+// Members see only their own sheet; admins and managers may open anyone's.
+const viewer = Astro.locals.user!;
+if (!canViewTimesheet(viewer, userId)) {
+  return new Response('You can only view your own timesheet.', { status: 403 });
+}
+
+const database = db();
+const settings = readSettings(database);
+const weekStart = startOfWeek(date, settings.weekStartDay);
+// Same payload the week grid uses — stepping between days costs no extra query.
+const week = getWeek(database, userId, weekStart);
+const entries = dayEntries(week, date);
+const users = listUsers(database);
+const today = todayIso();
+const running = entries.find((e) => e.is_running) ?? null;
+const elapsedNow = (e: typeof entries[number]) =>
+  e.timer_started_at ? Math.max(0, Math.floor((Date.now() - Date.parse(e.timer_started_at)) / 1000)) : 0;
+
+// A running timer's accrued seconds are not yet in duration_seconds, so counting only the
+// stored value under-reports the day while the clock is going.
+const dayTotal = entries.reduce((sum, e) => sum + e.duration_seconds + (e.is_running ? elapsedNow(e) : 0), 0);
+
+// `?edit=<id>` opens that entry's dialog server-side. With JavaScript the row click opens it
+// directly; without, this is the whole mechanism — and it makes an edit deep-linkable.
+const editId = Number(Astro.url.searchParams.get('edit')) || null;
+
+const projects = projectOptions(database, userId);
+const tasks = taskOptions(database, userId);
+const taskMapping = tasksByProject(database);
+
+const backTo = `/day/${date}/${userId}`;
+const dateLabel = `${dayLong(date)}, ${dayMonth(date)}`;
+---
+
+<App title={dateLabel} current="time">
+  <header class="row row--between mb-4 wrap">
+    <div class="row">
+      <div class="row joined">
+        <a class="btn btn--secondary" href={`/day/${addDays(date, -1)}/${userId}`} aria-label="Previous day">‹</a>
+        <a class="btn btn--secondary" href={`/day/${addDays(date, 1)}/${userId}`} aria-label="Next day">›</a>
+      </div>
+      <h1 class="page-title">{dateLabel}</h1>
+      {date !== today && <a class="small" href={`/day/${today}/${userId}`}>Today</a>}
+    </div>
+
+    <div class="row">
+      <div class="row joined">
+        <button class="btn" type="button" aria-disabled="true" tabindex="-1">Day</button>
+        <a class="btn btn--secondary" href={`/week/${weekStart}/${userId}`}>Week</a>
+      </div>
+
+      {users.length > 1 && (
+        <form method="get" action="/go" class="row gap-2">
+          <label class="visually-hidden" for="user-switch">Whose timesheet</label>
+          <input type="hidden" name="day" value={date} />
+          <select id="user-switch" class="field w-auto" name="user">
+            {users.map((u) => <option value={u.id} selected={u.id === userId}>{u.name}</option>)}
+          </select>
+          <button class="btn btn--secondary" type="submit">Go</button>
+        </form>
+      )}
+    </div>
+  </header>
+
+  {running && (
+    <p class="small mb-3 running-banner">
+      Timer running on <strong>{running.project_name}</strong> — {running.task_name}.
+      <span class="running" data-since={running.timer_started_at} data-base={running.duration_seconds}>
+        {formatDuration(running.duration_seconds + elapsedNow(running))}
+      </span>
+    </p>
+  )}
+
+  {viewer.id !== userId && (
+    <p class="small muted mb-3">
+      Viewing <strong>{users.find((u) => u.id === userId)?.name ?? 'another person'}</strong>’s
+      timesheet. Changes save to their sheet.
+    </p>
+  )}
+
+  <nav class="day-strip" aria-label="Days this week">
+    {week.dates.map((d, i) => (
+      <a href={`/day/${d}/${userId}`}
+         aria-current={d === date ? 'page' : undefined}
+         class:list={['day-tab', { 'is-today': d === today, 'is-weekend': isWeekend(d) }]}>
+        <span class="day-name">{dayShort(d)}</span>
+        <span class="day-date">{dayMonth(d)}</span>
+        <span class="day-tot">{formatCell(week.day_totals[i] ?? 0) || '–'}</span>
+      </a>
+    ))}
+  </nav>
+
+  <div class="table-wrap mt-3">
+    <table class="table entries">
+      <thead>
+        <tr>
+          <th scope="col">Project / Task</th>
+          <th scope="col">Notes</th>
+          <th scope="col" class="num">Hours</th>
+          <th scope="col"><span class="visually-hidden">Actions</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.length === 0 && (
+          <tr><td colspan="4" class="muted empty">
+            Nothing logged on this day.
+          </td></tr>
+        )}
+
+        {entries.map((e) => (
+          <tr class:list={['entry-row', { 'is-locked': e.is_locked }]}
+              data-entry={e.is_locked ? undefined : e.id}>
+            <td>
+              <span class="entry-project">
+                {e.project_code && <span class="code">[{e.project_code}]</span>}{e.project_name}
+              </span>
+              <span class="entry-client">{e.client_name}</span>
+              <span class="entry-task">{e.task_name}</span>
+            </td>
+            <td class="small">{e.notes ?? <span class="muted">—</span>}</td>
+            <td class="num">
+              {e.is_running ? (
+                <span class="running" data-since={e.timer_started_at} data-base={e.duration_seconds}>
+                  {formatDuration(e.duration_seconds + elapsedNow(e))}
+                </span>
+              ) : (
+                formatDuration(e.duration_seconds)
+              )}
+            </td>
+            <td class="num small">
+              {e.is_locked ? (
+                <span class="badge badge--locked" title={e.locked_reason ?? 'Locked'}>
+                  {e.locked_reason ?? 'Locked'}
+                </span>
+              ) : (
+                <span class="row gap-2" style="justify-content:flex-end;">
+                  {e.is_running ? (
+                    <form method="POST" action="/_actions/stopTimer">
+                      <input type="hidden" name="id" value={e.id} />
+                      <button class="btn btn--quiet small" type="submit">Stop</button>
+                    </form>
+                  ) : (
+                    <form method="POST" action="/_actions/startTimer">
+                      <input type="hidden" name="id" value={e.id} />
+                      <button class="btn btn--quiet small" type="submit" title="Start a timer on this entry">Start</button>
+                    </form>
+                  )}
+                  <a href={`${backTo}?edit=${e.id}`} data-edit={e.id}>Edit</a>
+                </span>
+              )}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+      <tfoot>
+        <tr>
+          <td colspan="2">Total</td>
+          <td class="num">{formatDuration(dayTotal)}</td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+
+  <div class="row mt-3">
+    <a class="btn js-new-entry" href="#new-entry">+ Add</a>
+  </div>
+
+  <script type="application/json" id="tasks-by-project" set:html={JSON.stringify(taskMapping)} is:inline></script>
+  <script type="application/json" id="all-tasks" set:html={JSON.stringify(tasks.map((t) => ({ id: t.id, name: t.name })))} is:inline></script>
+
+  <dialog class="dialog" id="new-entry" aria-labelledby="new-entry-title">
+    <h2 class="dialog__title" id="new-entry-title">
+      New time entry for <span>{dateLabel}</span>
+    </h2>
+    <form method="POST" action="/_actions/createEntry" class="dialog__form js-entry-form">
+      <input type="hidden" name="user_id" value={userId} />
+      <input type="hidden" name="spent_date" value={date} />
+
+      <div>
+        <label class="small" for="project">Project / Task</label>
+        <select class="field js-project" id="project" name="project_id" required>
+          {projects.map((p) => (
+            <option value={p.id}>{p.label} — {p.client_name}{p.is_active ? '' : ' (archived)'}</option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <select class="field js-task" name="task_id" required aria-label="Task">
+          {tasks.map((t) => <option value={t.id}>{t.name}</option>)}
+        </select>
+      </div>
+
+      <div class="entry-duration">
+        <div class="grow">
+          <textarea class="field js-notes" name="notes" rows="2" placeholder="Notes (optional)"></textarea>
+          <span class="xs muted"><kbd>Shift+Return</kbd> for line break</span>
+        </div>
+        <input class="field hours-input" name="hours" type="text" placeholder="0:00" aria-label="Hours" autocomplete="off" />
+      </div>
+
+      <div class="dialog__actions">
+        <div class="row">
+          <button class="btn" type="submit">Save entry</button>
+          <button class="btn btn--secondary js-close-new" type="button">Cancel</button>
+        </div>
+        <span class="xs muted">Leave hours blank to start a timer.</span>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- One dialog per editable entry. Rendered open when ?edit= names it, so editing works
+       with JavaScript off and an edit is a shareable URL. -->
+  {entries.filter((e) => !e.is_locked).map((e) => (
+    <dialog class="dialog" id={`entry-${e.id}`} open={editId === e.id ? true : undefined}
+            aria-labelledby={`entry-title-${e.id}`}>
+      <h2 class="dialog__title" id={`entry-title-${e.id}`}>
+        Edit time entry for <span>{dateLabel}</span>
+      </h2>
+
+      <form method="POST" action="/_actions/updateEntry" class="dialog__form js-entry-form">
+        <input type="hidden" name="id" value={e.id} />
+
+        <div>
+          <label class="small" for={`p-${e.id}`}>Project / Task</label>
+          <select class="field js-project" id={`p-${e.id}`} name="project_id" required>
+            {projects.map((p) => (
+              <option value={p.id} selected={p.id === e.project_id}>
+                {p.label} — {p.client_name}{p.is_active ? '' : ' (archived)'}
+              </option>
+            ))}
+          </select>
+        </div>
+        <select class="field js-task" name="task_id" required aria-label="Task">
+          {tasks.map((t) => <option value={t.id} selected={t.id === e.task_id}>{t.name}</option>)}
+        </select>
+
+        <div class="entry-duration">
+          <div class="grow">
+            <textarea class="field js-notes" name="notes" rows="2" placeholder="Notes (optional)">{e.notes ?? ''}</textarea>
+            <span class="xs muted"><kbd>Shift+Return</kbd> for line break</span>
+          </div>
+          <input class="field hours-input" name="hours" type="text" placeholder="0:00"
+                 aria-label="Hours" autocomplete="off" value={formatCell(e.duration_seconds)} />
+        </div>
+
+        <div class="dialog__actions">
+          <div class="row">
+            <button class="btn" type="submit">Update entry</button>
+            <a class="btn btn--secondary js-close" href={backTo}>Cancel</a>
+          </div>
+          <div class="row small">
+            <label class="row xs gap-2">
+              <span class="muted">Change date</span>
+              <input class="field w-auto" name="spent_date" type="date" value={e.spent_date} required />
+            </label>
+          </div>
+        </div>
+      </form>
+
+      <form method="POST" action="/_actions/deleteEntry" class="dialog__danger js-delete"
+            onsubmit="return confirm('Permanently delete this time entry?')">
+        <input type="hidden" name="id" value={e.id} />
+        <button class="btn btn--quiet small" type="submit">Delete</button>
+      </form>
+    </dialog>
+  ))}
+</App>
+
+<style>
+  .day-strip {
+    display: grid;
+    grid-template-columns: repeat(7, 1fr);
+    border: var(--app-border);
+    background: var(--app-surface);
+  }
+  .day-tab {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: var(--app-2);
+    text-align: center;
+    text-decoration: none;
+    border-right: var(--app-border);
+    font-size: var(--app-text-xs);
+  }
+  .day-tab:last-child { border-right: 0; }
+  .day-tab[aria-current='page'] { background: var(--color-ink); color: var(--color-text-on-dark); }
+  .day-tab .day-name { font-weight: var(--font-weight-medium); font-size: var(--app-text); }
+  .day-tab .day-date { color: var(--color-text-muted); }
+  .day-tab[aria-current='page'] .day-date { color: var(--color-text-on-dark-soft); }
+  .day-tab .day-tot { font-variant-numeric: tabular-nums; }
+
+  .entry-project { display: block; font-weight: var(--font-weight-medium); }
+  .entry-project .code { color: var(--color-text-muted); margin-right: 0.25em; }
+  .entry-client, .entry-task {
+    display: block;
+    font-size: var(--app-text-xs);
+    color: var(--color-text-muted);
+  }
+
+  /* The whole row opens the editor, so make that obvious. Locked rows do not. */
+  .entry-row[data-entry] { cursor: pointer; }
+
+  .running { font-variant-numeric: tabular-nums; color: var(--color-green-evening); }
+  .running-banner {
+    display: flex;
+    align-items: center;
+    gap: var(--app-2);
+    padding: var(--app-2) var(--app-3);
+    border-left: 2px solid var(--color-green-afternoon);
+    background: color-mix(in srgb, var(--color-green-dawn) 40%, transparent);
+  }
+  .entry-row[data-entry]:hover { background: var(--app-surface-sunken); }
+
+  .entry-duration { display: flex; gap: var(--app-3); align-items: flex-start; }
+  .hours-input {
+    width: 5.5rem;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+</style>
+
+<script>
+  // Enhancement. Without this the Edit link still works — it navigates to ?edit=<id>, which
+  // the server renders with the dialog already open.
+  const rows = document.querySelectorAll<HTMLTableRowElement>('.entry-row[data-entry]');
+
+  function open(id: string) {
+    const dialog = document.getElementById(`entry-${id}`) as HTMLDialogElement | null;
+    if (!dialog) return false;
+    dialog.showModal();
+    dialog.querySelector<HTMLElement>('select, input, textarea')?.focus();
+    return true;
+  }
+
+  for (const row of rows) {
+    row.addEventListener('click', (event) => {
+      // Leave real controls inside the row alone.
+      if ((event.target as HTMLElement).closest('a, button, input, select, textarea')) return;
+      if (row.dataset.entry) open(row.dataset.entry);
+    });
+  }
+
+  for (const link of document.querySelectorAll<HTMLAnchorElement>('a[data-edit]')) {
+    link.addEventListener('click', (event) => {
+      if (link.dataset.edit && open(link.dataset.edit)) event.preventDefault();
+    });
+  }
+
+  for (const cancel of document.querySelectorAll<HTMLAnchorElement>('.js-close')) {
+    cancel.addEventListener('click', (event) => {
+      const dialog = cancel.closest('dialog') as HTMLDialogElement | null;
+      if (dialog?.open) {
+        event.preventDefault();
+        dialog.close();
+      }
+    });
+  }
+
+  const newDialog = document.getElementById('new-entry') as HTMLDialogElement | null;
+  for (const trigger of document.querySelectorAll<HTMLAnchorElement>('.js-new-entry')) {
+    trigger.addEventListener('click', (event) => {
+      if (!newDialog) return;
+      event.preventDefault();
+      newDialog.showModal();
+      newDialog.querySelector<HTMLSelectElement>('select')?.focus();
+    });
+  }
+  for (const close of document.querySelectorAll<HTMLButtonElement>('.js-close-new')) {
+    close.addEventListener('click', () => newDialog?.close());
+  }
+
+  // Tasks follow the selected project. Options are rebuilt rather than hidden — a disabled
+  // <option> still renders in some browsers, and an unpickable choice is just noise.
+  const taskMap: Record<string, number[]> = JSON.parse(
+    document.getElementById('tasks-by-project')?.textContent || '{}',
+  );
+  const allTasks: { id: number; name: string }[] = JSON.parse(
+    document.getElementById('all-tasks')?.textContent || '[]',
+  );
+
+  function bindTaskFilter(project: HTMLSelectElement, task: HTMLSelectElement) {
+    const apply = () => {
+      const allowed = taskMap[project.value];
+      // A project with no assignments at all offers everything rather than nothing.
+      const list = allowed && allowed.length ? allTasks.filter((t) => allowed.includes(t.id)) : allTasks;
+      const wanted = task.value;
+
+      task.replaceChildren();
+      for (const item of list) {
+        const option = document.createElement('option');
+        option.value = String(item.id);
+        option.textContent = item.name;
+        task.append(option);
+      }
+      if (list.some((t) => String(t.id) === wanted)) task.value = wanted;
+      task.disabled = list.length === 0;
+    };
+    project.addEventListener('change', apply);
+    apply();
+  }
+
+  for (const form of document.querySelectorAll<HTMLFormElement>('.js-entry-form')) {
+    const project = form.querySelector<HTMLSelectElement>('.js-project');
+    const task = form.querySelector<HTMLSelectElement>('.js-task');
+    if (project && task) bindTaskFilter(project, task);
+  }
+
+  // A running timer ticks client-side. The server already rendered the correct value, so
+  // this only keeps it honest between page loads.
+  for (const clock of document.querySelectorAll<HTMLElement>('.running[data-since]')) {
+    const since = Date.parse(clock.dataset.since ?? '');
+    const base = Number(clock.dataset.base ?? 0);
+    if (!Number.isFinite(since)) continue;
+
+    const tick = () => {
+      const total = base + Math.max(0, Math.floor((Date.now() - since) / 1000));
+      const minutes = Math.round(total / 60);
+      clock.textContent = `${Math.floor(minutes / 60)}:${String(minutes % 60).padStart(2, '0')}`;
+    };
+    tick();
+    // Minute resolution is all h:mm can show, so there is no point waking every second.
+    setInterval(tick, 15_000);
+  }
+
+  // Return submits, Shift+Return breaks the line — as Harvest's editor does.
+  for (const notes of document.querySelectorAll<HTMLTextAreaElement>('.js-notes')) {
+    notes.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' && !event.shiftKey) {
+        event.preventDefault();
+        notes.closest('form')?.requestSubmit();
+      }
+    });
+  }
+</script>

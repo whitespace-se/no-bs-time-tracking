@@ -1,0 +1,11 @@
+.git
+.github
+.env
+.astro
+dist
+instances
+node_modules
+tmp
+*.db
+*.db-wal
+*.db-shm

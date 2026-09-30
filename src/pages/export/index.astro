@@ -1,0 +1,86 @@
+---
+import App from '../../layouts/App.astro';
+import { db } from '../../lib/db/index.ts';
+import { readSettings } from '../../lib/settings.ts';
+import { addDays, todayIso } from '../../lib/format.ts';
+
+const user = Astro.locals.user!;
+const admin = user.role === 'admin';
+const settings = readSettings(db());
+const to = todayIso();
+const from = addDays(to, -365);
+
+const SHEETS = [
+  { key: 'clients', label: 'Clients', note: 'Name, address, currency, archived state.' },
+  { key: 'projects', label: 'Projects', note: 'With client, rates, budgets and dates.' },
+  { key: 'tasks', label: 'Tasks', note: 'Defaults for billability and rate.' },
+  { key: 'people', label: 'People', note: 'Roles, Harvest grants, capacity and rates.' },
+  { key: 'assignments', label: 'Assignments', note: 'Who is on what, and which tasks bill.' },
+  { key: 'invoices', label: 'Invoices', note: 'One row per invoice: client, dates, amounts, state.' },
+  { key: 'invoice-lines', label: 'Invoice lines', note: 'Every line on every invoice, with its project.' },
+  { key: 'invoice-payments', label: 'Invoice payments', note: 'Payments recorded against invoices.' },
+  { key: 'expenses', label: 'Expenses', note: 'Every expense, with category, amount and receipt name.' },
+  { key: 'contacts', label: 'Contacts', note: 'People at clients, with who receives invoices.' },
+  { key: 'estimates', label: 'Estimates', note: 'One row per estimate: client, dates, amount, state.' },
+];
+---
+
+<App title="Export" current="reports">
+  <h1 class="page-title mb-2">Export</h1>
+  <p class="small muted prose-narrow mb-4">
+    Everything here is yours to take at any time, in formats other tools read. No request, no
+    waiting, no support ticket.
+  </p>
+
+  <section class="mb-4">
+    <h2 class="section-title">Time entries</h2>
+    <form method="get" action="/export/time-entries" class="row gap-3 wrap">
+      <div>
+        <label class="xs muted" for="from">From</label>
+        <input class="field w-auto" id="from" name="from" type="date" value={from} />
+      </div>
+      <div>
+        <label class="xs muted" for="to">To</label>
+        <input class="field w-auto" id="to" name="to" type="date" value={to} />
+      </div>
+      {!admin && <input type="hidden" name="user" value={user.id} />}
+      <button class="btn" type="submit">Download CSV</button>
+      <button class="btn btn--secondary" type="submit" formaction="/export/detailed-time.pdf">Download PDF</button>
+      <span class="xs muted">
+        {admin ? 'Everyone, unless you narrow it on the reports page.' : 'Your own time.'}
+      </span>
+    </form>
+  </section>
+
+  {admin && (
+    <section class="mb-4">
+      <h2 class="section-title">Everything else</h2>
+      <ul class="export-list">
+        {SHEETS.map((s) => (
+          <li>
+            <a class="btn btn--secondary" href={`/export/${s.key}`}>{s.label}</a>
+            <span class="xs muted">{s.note}</span>
+          </li>
+        ))}
+      </ul>
+    </section>
+  )}
+
+  {admin && (
+    <section>
+      <h2 class="section-title">The database itself</h2>
+      <p class="small muted prose-narrow mb-2">
+        One SQLite file containing everything, taken as a consistent snapshot while the app
+        keeps running. It opens in any SQLite tool, and it is the same file a self-hosted
+        instance would run from.
+      </p>
+      <a class="btn" href="/api/database">Download {settings.companyName || 'instance'} database</a>
+    </section>
+  )}
+</App>
+
+<style>
+  .export-list { list-style: none; display: flex; flex-direction: column; gap: var(--app-2); }
+  .export-list li { display: flex; align-items: center; gap: var(--app-3); }
+  .export-list .btn { min-width: 9rem; justify-content: center; }
+</style>

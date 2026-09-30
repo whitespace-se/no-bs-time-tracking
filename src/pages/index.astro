@@ -1,0 +1,15 @@
+---
+import { db } from '../lib/db/index.ts';
+import { startOfWeek, todayIso } from '../lib/format.ts';
+import { readSettings } from '../lib/settings.ts';
+
+const settings = readSettings(db());
+
+// Middleware guarantees a user here.
+const user = Astro.locals.user!;
+
+// This week, as Harvest does — not the week of your last entry. Someone returning after a
+// fortnight away would otherwise land on a fortnight-old grid that looks exactly like the
+// current one, and log Monday's hours to a Monday in the past.
+return Astro.redirect(`/week/${startOfWeek(todayIso(), settings.weekStartDay)}/${user.id}`, 302);
+---

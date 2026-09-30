@@ -1,0 +1,322 @@
+---
+/**
+ * API access — the administrator's page for this instance's API.
+ *
+ * Everything needed to hand an integration to someone: how to authenticate, what the rules
+ * are, what the endpoints are, and the tokens themselves. It sits under Admin because giving
+ * another system a standing read of the whole account is an administrative act, even though
+ * the token that results carries only its owner's permissions.
+ *
+ * A token is shown exactly once, at the moment it is made. Only its hash is stored, so there
+ * is no screen anywhere — here or in support — that can show it again, and saying so plainly
+ * is better than letting somebody discover it by looking.
+ */
+import App from '../layouts/App.astro';
+import { actions } from 'astro:actions';
+import { db } from '../lib/db/index.ts';
+import { listAllTokens, listTokens } from '../lib/auth/api-token.ts';
+import { EXPIRY_CHOICES } from '../actions/tokens.ts';
+import { DEFAULT_LIMIT, MAX_LIMIT, RATE_LIMIT_PER_MINUTE } from '../lib/api/http.ts';
+import { RESOURCES } from '../lib/api/resources.ts';
+import { readSettings } from '../lib/settings.ts';
+
+const viewer = Astro.locals.user!;
+if (viewer.role !== 'admin') return new Response('Administrators only.', { status: 403 });
+
+const database = db();
+const settings = readSettings(database);
+
+// Rendered from the action's own result, so a refresh cannot show the secret a second time.
+const created = Astro.getActionResult(actions.createApiToken);
+const revoked = Astro.getActionResult(actions.revokeApiToken);
+
+const mine = listTokens(database, viewer.id);
+const all = listAllTokens(database);
+const others = all.filter((t) => t.user_id !== viewer.id);
+
+const base = `${Astro.url.origin}/api/v1`;
+const now = new Date().toISOString().replace(/\.\d{3}Z$/, 'Z');
+const stamp = (iso: string | null) => (iso ? iso.replace('T', ' ').replace('Z', '') : null);
+
+const LIFETIMES: Record<number, string> = { 30: '30 days', 90: '90 days', 365: 'A year', 0: 'No expiry' };
+
+function state(token: { revoked_at: string | null; expires_at: string | null; last_used_at: string | null }) {
+  if (token.revoked_at) return { label: 'Revoked', kind: 'gone' as const };
+  if (token.expires_at && token.expires_at <= now) return { label: 'Expired', kind: 'gone' as const };
+  if (!token.last_used_at) return { label: 'Never used', kind: 'warn' as const };
+  return { label: 'Active', kind: 'ok' as const };
+}
+
+const live = all.filter((t) => state(t).kind !== 'gone').length;
+const minor = settings.currency === 'SEK' ? 'öre' : 'cents';
+---
+
+<App title="API access" current="api">
+  <div class="row row--between mb-1 wrap gap-3">
+    <h1 class="page-title">API access</h1>
+    <span class="xs muted">{live} live {live === 1 ? 'token' : 'tokens'} · {all.length} in total</span>
+  </div>
+  <p class="small muted prose-narrow mb-4">
+    Read-only access to this instance for other systems. Everything the pages here show is
+    readable through it; nothing writes.
+  </p>
+
+  {created?.data && (
+    <div class="reveal mb-4">
+      <p class="small mb-2">
+        <strong>{created.data.name}</strong> is ready. Copy it now — this is the only time it is
+        shown, because only its hash is stored.
+      </p>
+      <pre class="token"><code>{created.data.token}</code></pre>
+      <p class="xs muted mt-2">
+        {created.data.expires_at
+          ? `Expires ${created.data.expires_at.slice(0, 10)}.`
+          : 'No expiry. Revoke it below when it is no longer needed.'}
+      </p>
+    </div>
+  )}
+  {created?.error && <p class="alert mb-4" role="alert">{created.error.message}</p>}
+  {revoked?.error && <p class="alert mb-4" role="alert">{revoked.error.message}</p>}
+  {revoked?.data && <p class="note mb-4">Token revoked. Anything still using it now gets a 401.</p>}
+
+  <div class="cols">
+    <section>
+      <h2 class="section-title">New token</h2>
+      <form method="POST" action={actions.createApiToken} class="stack panel">
+        <div>
+          <label class="small" for="name">What is it for</label>
+          <input class="field" id="name" name="name" required maxlength="80"
+                 placeholder="Fortnox export, Grafana, laptop" />
+          <p class="xs muted mt-1">
+            A name you will recognise in six months, when you are deciding whether to revoke it.
+          </p>
+        </div>
+        <div>
+          <label class="small" for="expires_in_days">Lifetime</label>
+          <select class="field w-md" id="expires_in_days" name="expires_in_days">
+            {EXPIRY_CHOICES.map((days) => (
+              <option value={days} selected={days === 90}>{LIFETIMES[days]}</option>
+            ))}
+          </select>
+        </div>
+        <div class="row"><button class="btn" type="submit">Create token</button></div>
+      </form>
+      <p class="xs muted mt-3">
+        The token acts as you, and carries your permissions rather than its own. You cannot
+        create one for somebody else — that would be a way to act as them — but you can revoke
+        anyone's below.
+      </p>
+
+      <h2 class="section-title mt-5">How it works</h2>
+      <dl class="config">
+        <div><dt>Base URL</dt><dd class="mono">{base}</dd></div>
+        <div><dt>Auth</dt><dd class="mono">Authorization: Bearer &lt;token&gt;</dd></div>
+        <div><dt>Money</dt><dd>Whole {minor}, never a decimal, with the currency beside it.</dd></div>
+        <div><dt>Durations</dt><dd>Whole seconds.</dd></div>
+        <div><dt>Paging</dt><dd>{DEFAULT_LIMIT} by default, {MAX_LIMIT} at most. Follow <span class="mono">pagination.next</span>.</dd></div>
+        <div><dt>Rate limit</dt><dd>{RATE_LIMIT_PER_MINUTE} requests a minute per token.</dd></div>
+        <div><dt>Changes only</dt><dd>Every endpoint takes <span class="mono">updated_since</span>, for syncing rather than re-copying.</dd></div>
+      </dl>
+
+      <h2 class="section-title mt-5">Reference</h2>
+      <ul class="links">
+        <li><a href="/docs">Browse and try the API</a> <span class="xs muted">Swagger, served by this instance</span></li>
+        <li><a href="/api/v1/openapi.json">openapi.json</a> <span class="xs muted">For clients and code generators</span></li>
+        <li><a href="/api/v1">/api/v1</a> <span class="xs muted">Lists itself</span></li>
+        <li><a href="/export">CSV export</a> <span class="xs muted">The same data, for a spreadsheet</span></li>
+      </ul>
+    </section>
+
+    <section>
+      <h2 class="section-title">Try it</h2>
+      <pre class="snippet"><code>{`curl -H "Authorization: Bearer $TT_TOKEN" \\
+  ${base}/me`}</code></pre>
+
+      <h2 class="section-title mt-5">Endpoints</h2>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Endpoint</th>
+              <th scope="col">What it holds</th>
+              <th scope="col">Who may read it</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td class="mono xs"><a href={`${base}/me`}>/me</a></td>
+              <td class="small muted">The token and its owner</td>
+              <td class="xs muted">Anyone with a token</td>
+            </tr>
+            {RESOURCES.map((resource) => (
+              <tr>
+                <td class="mono xs"><a href={`${base}/${resource.name}`}>/{resource.name}</a></td>
+                <td class="small muted">{resource.summary}</td>
+                <td class="xs muted">
+                  {resource.access === 'privileged'
+                    ? 'Managers and admins'
+                    : resource.viewerColumn
+                      ? 'Anyone, members see their own'
+                      : 'Anyone'}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <p class="xs muted mt-2">
+        Rates, costs, fees and budgets are left out of every response to a member's token.
+      </p>
+
+      <h2 class="section-title mt-5">Your tokens</h2>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Name</th>
+              <th scope="col">Token</th>
+              <th scope="col">Created</th>
+              <th scope="col">Last used</th>
+              <th scope="col">Expires</th>
+              <th scope="col">Status</th>
+              <th scope="col"><span class="visually-hidden">Revoke</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            {mine.length === 0 && <tr><td colspan="7" class="muted empty--sm">No tokens yet.</td></tr>}
+            {mine.map((token) => {
+              const s = state(token);
+              return (
+                <tr class:list={[{ 'is-locked': s.kind === 'gone' }]}>
+                  <td class="medium">{token.name}</td>
+                  <td class="xs mono muted">{token.prefix}…</td>
+                  <td class="xs muted">{token.created_at.slice(0, 10)}</td>
+                  <td class="xs muted">{token.last_used_at ? stamp(token.last_used_at) : '—'}</td>
+                  <td class="xs muted">{token.expires_at ? token.expires_at.slice(0, 10) : 'never'}</td>
+                  <td class="xs">
+                    {s.kind === 'ok' && <span class="badge badge--billable">{s.label}</span>}
+                    {s.kind === 'warn' && <span class="badge">{s.label}</span>}
+                    {s.kind === 'gone' && <span class="badge badge--locked">{s.label}</span>}
+                  </td>
+                  <td class="num">
+                    {s.kind !== 'gone' && (
+                      <form method="POST" action={actions.revokeApiToken}>
+                        <input type="hidden" name="id" value={token.id} />
+                        <button class="btn btn--quiet small" type="submit">Revoke</button>
+                      </form>
+                    )}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {others.length > 0 && (
+        <>
+          <h2 class="section-title mt-5">Everyone else's</h2>
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th scope="col">Owner</th>
+                  <th scope="col">Name</th>
+                  <th scope="col">Token</th>
+                  <th scope="col">Last used</th>
+                  <th scope="col">Expires</th>
+                  <th scope="col">Status</th>
+                  <th scope="col"><span class="visually-hidden">Revoke</span></th>
+                </tr>
+              </thead>
+              <tbody>
+                {others.map((token) => {
+                  const s = state(token);
+                  return (
+                    <tr class:list={[{ 'is-locked': s.kind === 'gone' }]}>
+                      <td class="small">
+                        <a href={`/team/${token.user_id}`}>{token.owner || token.owner_email}</a>
+                        <span class="xs muted"> · {token.owner_role}</span>
+                      </td>
+                      <td class="medium">{token.name}</td>
+                      <td class="xs mono muted">{token.prefix}…</td>
+                      <td class="xs muted">{token.last_used_at ? stamp(token.last_used_at) : '—'}</td>
+                      <td class="xs muted">{token.expires_at ? token.expires_at.slice(0, 10) : 'never'}</td>
+                      <td class="xs">
+                        {s.kind === 'ok' && <span class="badge badge--billable">{s.label}</span>}
+                        {s.kind === 'warn' && <span class="badge">{s.label}</span>}
+                        {s.kind === 'gone' && <span class="badge badge--locked">{s.label}</span>}
+                      </td>
+                      <td class="num">
+                        {s.kind !== 'gone' && (
+                          <form method="POST" action={actions.revokeApiToken}>
+                            <input type="hidden" name="id" value={token.id} />
+                            <button class="btn btn--quiet small" type="submit">Revoke</button>
+                          </form>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p class="xs muted mt-2">
+            A token whose owner has left keeps reading the account until somebody revokes it.
+            That is what this table is for.
+          </p>
+        </>
+      )}
+    </section>
+  </div>
+</App>
+
+<style>
+  .cols { display: grid; gap: var(--app-6); align-items: start; }
+  @media (min-width: 64em) { .cols { grid-template-columns: 24rem 1fr; } }
+
+  .panel { padding: var(--app-3); border: var(--app-border); background: var(--app-surface); }
+
+  .reveal {
+    padding: var(--app-3);
+    border: var(--app-border);
+    border-left: 3px solid var(--color-green-evening);
+    background: var(--app-surface);
+  }
+  .token,
+  .snippet {
+    margin: 0;
+    padding: var(--app-2) var(--app-3);
+    border: var(--app-border);
+    background: var(--app-surface);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: var(--app-text-sm);
+    overflow-x: auto;
+  }
+  .token { user-select: all; }
+
+  .alert {
+    padding: var(--app-2) var(--app-3);
+    border: var(--app-border);
+    border-left: 3px solid var(--color-warning);
+    background: var(--app-surface);
+    font-size: var(--app-text-sm);
+  }
+  .note {
+    padding: var(--app-2) var(--app-3);
+    border: var(--app-border);
+    background: var(--app-surface);
+    font-size: var(--app-text-sm);
+  }
+
+  .config { display: grid; gap: var(--app-2); margin: 0; }
+  .config > div { display: grid; grid-template-columns: 7rem 1fr; gap: var(--app-2); align-items: baseline; }
+  .config dt { font-size: var(--app-text-sm); color: var(--color-text-muted); }
+  .config dd { margin: 0; font-size: var(--app-text-sm); word-break: break-word; }
+
+  .links { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--app-2); }
+  .links li { font-size: var(--app-text-sm); }
+  .links .xs { display: block; }
+
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+</style>

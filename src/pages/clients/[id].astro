@@ -1,0 +1,290 @@
+---
+import App from '../../layouts/App.astro';
+import { actions } from 'astro:actions';
+import { db, row as sqlRow, rows as sqlRows } from '../../lib/db/index.ts';
+import { formatDuration, formatMoney } from '../../lib/format.ts';
+import { readSettings } from '../../lib/settings.ts';
+
+const user = Astro.locals.user!;
+if (user.role !== 'admin') return new Response('Administrators only.', { status: 403 });
+
+const saved = Astro.getActionResult(actions.saveClient);
+if (saved && !saved.error) return Astro.redirect(`/clients/${saved.data.id}`, 303);
+
+const param = Astro.params.id ?? '';
+const isNew = param === 'new';
+const clientId = isNew ? 0 : Number(param);
+
+if (!isNew && (!Number.isInteger(clientId) || clientId <= 0)) {
+  return new Response('Not found', { status: 404 });
+}
+
+const database = db();
+const settings = readSettings(database);
+
+interface ClientRecord {
+  id: number;
+  name: string;
+  address: string | null;
+  currency: string;
+  is_active: number;
+}
+
+const client = isNew
+  ? null
+  : sqlRow<ClientRecord>(
+      database
+        .prepare('SELECT id, name, address, currency, is_active FROM clients WHERE id = ?')
+        .get(clientId),
+    );
+
+if (!isNew && !client) return new Response('Not found', { status: 404 });
+
+const invoices = isNew
+  ? []
+  : sqlRows<{ id: number; number: string; state: string; subject: string | null; issue_date: string; amount: number; due_amount: number; currency: string }>(
+      database
+        .prepare(
+          `SELECT id, number, state, subject, issue_date, amount, due_amount, currency
+             FROM invoices WHERE client_id = ?
+         ORDER BY issue_date DESC, CAST(number AS INTEGER) DESC LIMIT 12`,
+        )
+        .all(clientId),
+    );
+const invoiceCount = isNew
+  ? 0
+  : (sqlRow<{ n: number }>(
+      database.prepare('SELECT COUNT(*) AS n FROM invoices WHERE client_id = ?').get(clientId),
+    )?.n ?? 0);
+
+const contacts = isNew
+  ? []
+  : sqlRows<{ id: number; name: string; title: string | null; email: string | null; phone_office: string | null; phone_mobile: string | null; invoice_recipient_status: string }>(
+      database
+        .prepare(
+          `SELECT id, TRIM(first_name || ' ' || last_name) AS name, title, email, phone_office,
+                  phone_mobile, invoice_recipient_status
+             FROM contacts WHERE client_id = ? ORDER BY invoice_recipient_status = 'primary' DESC, last_name, first_name`,
+        )
+        .all(clientId),
+    );
+const estimates = isNew
+  ? []
+  : sqlRows<{ id: number; number: string; state: string; subject: string | null; issue_date: string; amount: number; currency: string }>(
+      database
+        .prepare(
+          `SELECT id, number, state, subject, issue_date, amount, currency FROM estimates
+            WHERE client_id = ? ORDER BY issue_date DESC, CAST(number AS INTEGER) DESC LIMIT 12`,
+        )
+        .all(clientId),
+    );
+
+const projects = isNew
+  ? []
+  : sqlRows<{ id: number; name: string; code: string | null; is_active: number; seconds: number }>(
+      database
+        .prepare(
+          `SELECT p.id, p.name, p.code, p.is_active,
+                  COALESCE((SELECT SUM(duration_seconds) FROM time_entries WHERE project_id = p.id), 0) AS seconds
+             FROM projects p WHERE p.client_id = ?
+         ORDER BY p.is_active DESC, seconds DESC, p.name`,
+        )
+        .all(clientId),
+    );
+---
+
+<App title={isNew ? 'New client' : client!.name} current="clients">
+  <p class="xs muted mb-2">
+    <a href="/clients">Clients</a> / {isNew ? 'New' : client!.name}
+  </p>
+
+  <h1 class="page-title mb-4">
+    {isNew ? 'New client' : client!.name}
+  </h1>
+
+  <div class="detail-grid">
+    <section>
+      <form method="POST" action={actions.saveClient} class="stack">
+        {!isNew && <input type="hidden" name="id" value={client!.id} />}
+        <div>
+          <label class="small" for="name">Name</label>
+          <input class="field" id="name" name="name" required value={client?.name ?? ''} />
+        </div>
+        <div>
+          <label class="small" for="address">Address</label>
+          <textarea class="field" id="address" name="address" rows="3">{client?.address ?? ''}</textarea>
+        </div>
+        <div>
+          <label class="small" for="currency">Currency</label>
+          <input class="field w-xs" id="currency" name="currency" maxlength="3"
+                 value={client?.currency ?? settings.currency} />
+        </div>
+        <label class="row small gap-2">
+          <input type="checkbox" name="is_active" value="true" checked={client ? Boolean(client.is_active) : true} />
+          Active
+        </label>
+        <div class="row">
+          <button class="btn" type="submit">{isNew ? 'Create client' : 'Save client'}</button>
+          <a class="btn btn--secondary" href="/clients">Cancel</a>
+        </div>
+      </form>
+    </section>
+
+    {!isNew && (
+      <section>
+        <h2 class="detail-head">Projects <span class="muted small">({projects.length})</span></h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th scope="col">Project</th>
+                <th scope="col" class="num">Hours</th>
+                <th scope="col">Status</th>
+              </tr>
+            </thead>
+            <tbody>
+              {projects.length === 0 && (
+                <tr><td colspan="3" class="muted empty--sm">
+                  No projects for this client.
+                </td></tr>
+              )}
+              {projects.map((p) => (
+                <tr class:list={[{ 'is-locked': !p.is_active }]}>
+                  <td>
+                    <a href={`/projects/${p.id}`}>
+                      {p.code && <span class="muted">[{p.code}] </span>}{p.name}
+                    </a>
+                  </td>
+                  <td class="num">{formatDuration(p.seconds)}</td>
+                  <td class="xs">
+                    {p.is_active ? <span class="muted">Active</span> : <span class="badge badge--locked">Archived</span>}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {contacts.length > 0 && (
+          <>
+            <h2 class="detail-head mt-5">Contacts <span class="muted small">({contacts.length})</span></h2>
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th scope="col">Name</th>
+                    <th scope="col">Title</th>
+                    <th scope="col">Email</th>
+                    <th scope="col">Phone</th>
+                    <th scope="col">Invoices</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {contacts.map((c) => (
+                    <tr>
+                      <td class="medium">{c.name}</td>
+                      <td class="small muted">{c.title ?? '—'}</td>
+                      <td class="small">{c.email ? <a href={`mailto:${c.email}`}>{c.email}</a> : <span class="muted">—</span>}</td>
+                      <td class="small">{c.phone_mobile ?? c.phone_office ?? <span class="muted">—</span>}</td>
+                      <td class="xs">
+                        {c.invoice_recipient_status === 'primary' && <span class="badge badge--billable">Recipient</span>}
+                        {c.invoice_recipient_status === 'cc' && <span class="badge">Copy</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+
+        {(user.role === 'admin' || user.role === 'manager') && estimates.length > 0 && (
+          <>
+            <h2 class="detail-head mt-5">Estimates <span class="muted small">({estimates.length})</span></h2>
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th scope="col">Number</th>
+                    <th scope="col">Subject</th>
+                    <th scope="col">Issued</th>
+                    <th scope="col" class="num">Amount</th>
+                    <th scope="col">State</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {estimates.map((e) => (
+                    <tr>
+                      <td class="medium"><a href={`/estimates/${e.id}`}>#{e.number}</a></td>
+                      <td class="small muted">{e.subject ?? '—'}</td>
+                      <td class="xs">{e.issue_date}</td>
+                      <td class="num">{formatMoney(e.amount, settings)} {e.currency !== settings.currency ? e.currency : ''}</td>
+                      <td class="xs">
+                        {e.state === 'accepted' && <span class="badge badge--billable">Accepted</span>}
+                        {e.state === 'sent' && <span class="badge">Sent</span>}
+                        {e.state === 'draft' && <span class="muted">Draft</span>}
+                        {e.state === 'declined' && <span class="badge badge--locked">Declined</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        )}
+
+        {(user.role === 'admin' || user.role === 'manager') && invoiceCount > 0 && (
+          <>
+            <h2 class="detail-head mt-5">
+              Invoices <span class="muted small">({invoiceCount})</span>
+            </h2>
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th scope="col">Number</th>
+                    <th scope="col">Subject</th>
+                    <th scope="col">Issued</th>
+                    <th scope="col" class="num">Amount</th>
+                    <th scope="col">State</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {invoices.map((i) => (
+                    <tr class:list={[{ 'is-locked': i.state === 'closed' }]}>
+                      <td class="medium"><a href={`/invoices/${i.id}`}>#{i.number}</a></td>
+                      <td class="small muted">{i.subject ?? '—'}</td>
+                      <td class="xs">{i.issue_date}</td>
+                      <td class="num">{formatMoney(i.amount, settings)} {i.currency !== settings.currency ? i.currency : ''}</td>
+                      <td class="xs">
+                        {i.state === 'paid' && <span class="badge badge--billable">Paid</span>}
+                        {i.state === 'open' && <span class="badge">Open</span>}
+                        {i.state === 'draft' && <span class="muted">Draft</span>}
+                        {i.state === 'closed' && <span class="badge badge--locked">Closed</span>}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {invoiceCount > invoices.length && (
+              <p class="xs mt-2">
+                <a href={`/invoices?client=${client!.id}`}>All {invoiceCount} invoices</a>
+              </p>
+            )}
+          </>
+        )}
+      </section>
+    )}
+  </div>
+</App>
+
+<style>
+  .detail-grid { display: grid; grid-template-columns: 1fr; gap: var(--app-5); }
+  @media (min-width: 64em) { .detail-grid { grid-template-columns: 22rem 1fr; } }
+  .detail-head {
+    font-size: var(--size-heading-s);
+    font-weight: var(--font-weight-medium);
+    margin-bottom: var(--app-2);
+  }
+</style>

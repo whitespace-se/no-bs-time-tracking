@@ -1,0 +1,70 @@
+---
+import { actions } from 'astro:actions';
+import App from '../../layouts/App.astro';
+import { db, rows } from '../../lib/db/index.ts';
+import { readSettings } from '../../lib/settings.ts';
+
+const user = Astro.locals.user!;
+if (user.role !== 'admin') return new Response('Administrators only.', { status: 403 });
+
+const saved = Astro.getActionResult(actions.saveProject);
+if (saved && !saved.error) return Astro.redirect(`/projects/${saved.data.id}`, 303);
+
+const clients = rows<{ id: number; name: string }>(
+  db().prepare('SELECT id, name FROM clients WHERE is_active = 1 ORDER BY name').all(),
+);
+const settings = readSettings(db());
+---
+
+<App title="New project" current="projects">
+  <p class="xs muted mb-2"><a href="/projects">Projects</a> / New</p>
+  <h1 class="page-title mb-4">New project</h1>
+
+  {clients.length === 0 ? (
+    <div class="panel form-narrow">
+      <p class="small mb-3">A project needs a client first.</p>
+      <a class="btn" href="/clients/new">Create a client</a>
+    </div>
+  ) : (
+    <form method="POST" action={actions.saveProject} class="stack form-mid panel">
+      <div>
+        <label class="small" for="client_id">Client</label>
+        <select class="field" id="client_id" name="client_id" required>
+          {clients.map((client) => <option value={client.id}>{client.name}</option>)}
+        </select>
+      </div>
+      <div>
+        <label class="small" for="name">Name</label>
+        <input class="field" id="name" name="name" required />
+      </div>
+      <div>
+        <label class="small" for="code">Code</label>
+        <input class="field" id="code" name="code" />
+      </div>
+      <div>
+        <label class="small" for="hourly_rate">Hourly rate ({settings.currency})</label>
+        <input class="field w-sm" id="hourly_rate" name="hourly_rate" inputmode="decimal" />
+      </div>
+      <div>
+        <label class="small" for="notes">Notes</label>
+        <textarea class="field" id="notes" name="notes" rows="3"></textarea>
+      </div>
+      <input type="hidden" name="bill_by" value="Project" />
+      <input type="hidden" name="budget_by" value="none" />
+      <label class="row small gap-2">
+        <input type="checkbox" name="is_billable" value="true" checked /> Billable
+      </label>
+      <label class="row small gap-2">
+        <input type="checkbox" name="is_active" value="true" checked /> Active
+      </label>
+      <div class="row">
+        <button class="btn" type="submit">Create project</button>
+        <a class="btn btn--secondary" href="/projects">Cancel</a>
+      </div>
+    </form>
+  )}
+</App>
+
+<style>
+  .panel { padding: var(--app-4); border: var(--app-border); background: var(--app-surface); }
+</style>

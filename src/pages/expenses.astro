@@ -1,0 +1,314 @@
+---
+/**
+ * Expenses, read from Harvest — the same shape as the time log: a date, a person, a project,
+ * an amount, and whether it was billed. Members see their own; administrators and managers
+ * see everyone's. Receipts open from the row; they live in the instance folder.
+ */
+import App from '../layouts/App.astro';
+import Pagination from '../components/Pagination.astro';
+import { db, row as sqlRow, rows as sqlRows } from '../lib/db/index.ts';
+import { formatCount, formatMoney, todayIso } from '../lib/format.ts';
+import { paginate, pageHref, readPageParams } from '../lib/paginate.ts';
+import { readSettings } from '../lib/settings.ts';
+import {
+  readTimeframe,
+  resolve as resolveTimeframe,
+  step,
+  TIMEFRAME_KINDS,
+  TIMEFRAME_LABELS,
+} from '../lib/timeframe.ts';
+
+const viewer = Astro.locals.user!;
+const privileged = viewer.role === 'admin' || viewer.role === 'manager';
+const database = db();
+const settings = readSettings(database);
+const money = (minor: number) => formatMoney(minor, settings);
+const today = todayIso();
+
+const bounds = sqlRow<{ first: string | null; last: string | null }>(
+  database.prepare('SELECT MIN(spent_date) AS first, MAX(spent_date) AS last FROM expenses').get(),
+) ?? { first: null, last: null };
+const frameOptions = { weekStartDay: settings.weekStartDay, fiscalYearStart: settings.fiscalYearStart, bounds };
+const frame = Astro.url.searchParams.has('kind')
+  ? readTimeframe(Astro.url, frameOptions)
+  : resolveTimeframe('all', today, frameOptions);
+const previous = step(frame, -1, frameOptions);
+const next = step(frame, 1, frameOptions);
+
+// A member's person filter is always themselves, whatever the URL says.
+const requestedUser = Number(Astro.url.searchParams.get('user')) || 0;
+const userId = privileged ? requestedUser : viewer.id;
+const categoryId = Number(Astro.url.searchParams.get('category')) || 0;
+const billableParam = Astro.url.searchParams.get('billable') ?? '';
+const billable = billableParam === 'yes' ? 1 : billableParam === 'no' ? 0 : -1;
+
+const WHERE = `e.spent_date BETWEEN ? AND ?
+   AND (? = 0 OR e.user_id = ?)
+   AND (? = 0 OR e.expense_category_id = ?)
+   AND (? = -1 OR e.billable = ?)`;
+const args = [frame.from, frame.to, userId, userId, categoryId, categoryId, billable, billable];
+
+const query = (changes: Record<string, string | number | null>) =>
+  pageHref(Astro.url, { kind: frame.kind, from: frame.from, till: null, page: null, ...changes });
+
+const summary = sqlRow<{ n: number; total: number; billable: number; unbilled: number }>(
+  database
+    .prepare(
+      `SELECT COUNT(*) AS n,
+              COALESCE(SUM(e.total_cost), 0) AS total,
+              COALESCE(SUM(CASE WHEN e.billable = 1 THEN e.total_cost END), 0) AS billable,
+              COALESCE(SUM(CASE WHEN e.billable = 1 AND e.is_billed = 0 THEN e.total_cost END), 0) AS unbilled
+         FROM expenses e WHERE ${WHERE}`,
+    )
+    .get(...args),
+) ?? { n: 0, total: 0, billable: 0, unbilled: 0 };
+
+const { page: pageNo, perPage } = readPageParams(Astro.url);
+const pageInfo = paginate(summary.n, pageNo, perPage);
+
+interface ExpenseRow {
+  id: number;
+  spent_date: string;
+  person: string;
+  user_id: number;
+  client: string | null;
+  project: string;
+  project_code: string | null;
+  project_id: number;
+  category: string | null;
+  unit_name: string | null;
+  notes: string | null;
+  units: number;
+  total_cost: number;
+  billable: number;
+  is_billed: number;
+  is_locked: number;
+  locked_reason: string | null;
+  invoice_id: number | null;
+  invoice_number: string | null;
+  receipt_path: string | null;
+  receipt_file_name: string | null;
+}
+
+const expenses = sqlRows<ExpenseRow>(
+  database
+    .prepare(
+      `SELECT e.id, e.spent_date, TRIM(u.first_name || ' ' || u.last_name) AS person, e.user_id,
+              c.name AS client, p.name AS project, p.code AS project_code, p.id AS project_id,
+              ec.name AS category, ec.unit_name, e.notes, e.units, e.total_cost, e.billable,
+              e.is_billed, e.is_locked, e.locked_reason, e.invoice_id, i.number AS invoice_number,
+              e.receipt_path, e.receipt_file_name
+         FROM expenses e
+         JOIN users u ON u.id = e.user_id
+         JOIN projects p ON p.id = e.project_id
+    LEFT JOIN clients c ON c.id = p.client_id
+    LEFT JOIN expense_categories ec ON ec.id = e.expense_category_id
+    LEFT JOIN invoices i ON i.id = e.invoice_id
+        WHERE ${WHERE}
+     ORDER BY e.spent_date DESC, e.id DESC
+        LIMIT ? OFFSET ?`,
+    )
+    .all(...args, pageInfo.perPage, pageInfo.offset),
+);
+
+const people = privileged
+  ? sqlRows<{ id: number; name: string }>(
+      database
+        .prepare(
+          `SELECT u.id, TRIM(u.first_name || ' ' || u.last_name) AS name FROM users u
+            WHERE EXISTS (SELECT 1 FROM expenses e WHERE e.user_id = u.id)
+         ORDER BY u.first_name, u.last_name`,
+        )
+        .all(),
+    )
+  : [];
+const categories = sqlRows<{ id: number; name: string }>(
+  database
+    .prepare(
+      `SELECT ec.id, ec.name FROM expense_categories ec
+        WHERE EXISTS (SELECT 1 FROM expenses e WHERE e.expense_category_id = ec.id)
+     ORDER BY ec.name`,
+    )
+    .all(),
+);
+
+/** 2.5 km → "2,5 km"; a bare 1 of nothing in particular is not worth a column. */
+const units = (value: number, unit: string | null) => {
+  if (!unit) return '';
+  const n = Number.isInteger(value) ? String(value) : String(value).replace('.', settings.decimalSymbol);
+  return `${n} ${unit}`;
+};
+
+const filtering = userId !== 0 || categoryId !== 0 || billable !== -1;
+const timeframed = Astro.url.searchParams.has('kind') && frame.kind !== 'all';
+---
+
+<App title="Expenses" current="expenses">
+  <header class="tf">
+    <div class="row gap-2 wrap">
+      {frame.steppable && (
+        <div class="joined">
+          <a class="btn btn--secondary" href={query({ from: previous.from })} aria-label="Previous period">‹</a>
+          <a class="btn btn--secondary" href={query({ from: next.from })} aria-label="Next period">›</a>
+        </div>
+      )}
+      <h1 class="page-title">
+        {timeframed ? frame.label : 'Expenses'}
+        <span class="muted small"> ({formatCount(pageInfo.total, settings)})</span>
+      </h1>
+      {frame.canReturn && (
+        <a class="small" href={query({ from: today })}>Return to this {frame.kind}</a>
+      )}
+    </div>
+    <form method="get" class="row gap-2 wrap">
+      <input type="hidden" name="from" value={frame.from} />
+      {userId !== 0 && privileged && <input type="hidden" name="user" value={userId} />}
+      {categoryId !== 0 && <input type="hidden" name="category" value={categoryId} />}
+      {billableParam && <input type="hidden" name="billable" value={billableParam} />}
+      <select class="field w-auto" name="kind" aria-label="Timeframe">
+        {TIMEFRAME_KINDS.filter((k) => k !== 'custom').map((k) => (
+          <option value={k} selected={k === frame.kind}>{TIMEFRAME_LABELS[k]}</option>
+        ))}
+      </select>
+      <button class="btn btn--secondary" type="submit">Apply</button>
+      {viewer.role === 'admin' && <a class="small ml-2" href="/export/expenses">Download CSV</a>}
+    </form>
+  </header>
+
+  <form method="get" class="filters mb-4">
+    {timeframed && (
+      <>
+        <input type="hidden" name="kind" value={frame.kind} />
+        <input type="hidden" name="from" value={frame.from} />
+      </>
+    )}
+    {privileged && (
+      <div>
+        <label class="xs muted" for="user">Person</label>
+        <select class="field" id="user" name="user">
+          <option value="">Everyone</option>
+          {people.map((p) => <option value={p.id} selected={p.id === userId}>{p.name}</option>)}
+        </select>
+      </div>
+    )}
+    <div>
+      <label class="xs muted" for="category">Category</label>
+      <select class="field" id="category" name="category">
+        <option value="">Any</option>
+        {categories.map((c) => <option value={c.id} selected={c.id === categoryId}>{c.name}</option>)}
+      </select>
+    </div>
+    <div>
+      <label class="xs muted" for="billable">Billable</label>
+      <select class="field" id="billable" name="billable">
+        <option value="">Both</option>
+        <option value="yes" selected={billableParam === 'yes'}>Billable</option>
+        <option value="no" selected={billableParam === 'no'}>Non-billable</option>
+      </select>
+    </div>
+    <div class="filters__actions">
+      <button class="btn" type="submit">Filter</button>
+      {filtering && <a class="small" href={query({ user: null, category: null, billable: null })}>Clear</a>}
+    </div>
+  </form>
+
+  <div class="stats mb-4">
+    <div class="stat">
+      <span class="stat__label">Expenses</span>
+      <span class="stat__big">{formatCount(summary.n, settings)}</span>
+    </div>
+    <div class="stat">
+      <span class="stat__label">Total</span>
+      <span class="stat__big">{money(summary.total)} {settings.currency}</span>
+    </div>
+    <div class="stat">
+      <span class="stat__label">Billable</span>
+      <span class="stat__big">{money(summary.billable)} {settings.currency}</span>
+    </div>
+    <div class="stat">
+      <span class="stat__label">Unbilled</span>
+      <span class="stat__big">{money(summary.unbilled)} {settings.currency}</span>
+      <span class="xs muted">Billable, not yet on an invoice</span>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="table table--banded">
+      <thead>
+        <tr>
+          <th scope="col">Date</th>
+          {privileged && <th scope="col">Person</th>}
+          <th scope="col">Project</th>
+          <th scope="col">Category</th>
+          <th scope="col">Notes</th>
+          <th scope="col" class="num">Amount</th>
+          <th scope="col">Status</th>
+          <th scope="col">Receipt</th>
+        </tr>
+      </thead>
+      <tbody>
+        {expenses.length === 0 && (
+          <tr><td colspan={privileged ? 8 : 7} class="muted empty">
+            {filtering || timeframed ? 'No expenses in this view.' : 'No expenses yet. They arrive with the Harvest import.'}
+          </td></tr>
+        )}
+        {expenses.map((e) => (
+          <tr class:list={[{ 'is-locked': e.is_locked }]}>
+            <td class="xs nowrap">{e.spent_date}</td>
+            {privileged && <td class="small"><a href={query({ user: e.user_id })}>{e.person}</a></td>}
+            <td class="small">
+              <a href={`/projects/${e.project_id}`}>
+                {e.project_code && <span class="muted">[{e.project_code}] </span>}{e.project}
+              </a>
+              {e.client && <span class="xs muted"> · {e.client}</span>}
+            </td>
+            <td class="xs">
+              {e.category ?? <span class="muted">—</span>}
+              {units(e.units, e.unit_name) && <span class="muted"> · {units(e.units, e.unit_name)}</span>}
+            </td>
+            <td class="small muted">{e.notes ?? ''}</td>
+            <td class="num nowrap">{money(e.total_cost)}</td>
+            <td class="xs">
+              {e.billable ? <span class="badge badge--billable">Billable</span> : <span class="muted">Non-billable</span>}
+              {e.is_billed && (
+                e.invoice_number
+                  ? <a class="badge badge--locked ml-2" href={`/invoices/${e.invoice_id}`}>#{e.invoice_number}</a>
+                  : <span class="badge badge--locked ml-2">Billed</span>
+              )}
+            </td>
+            <td class="xs">
+              {e.receipt_path
+                ? <a href={`/expenses/${e.id}/receipt`} title={e.receipt_file_name ?? ''}>Open</a>
+                : e.receipt_file_name
+                  ? <span class="muted" title="Described by Harvest, file not fetched">Not fetched</span>
+                  : <span class="muted">—</span>}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <Pagination page={pageInfo} url={Astro.url} label="expenses" />
+</App>
+
+<style>
+  .tf {
+    display: flex; justify-content: space-between; align-items: center; gap: var(--app-3);
+    flex-wrap: wrap; padding-bottom: var(--app-3); margin-bottom: var(--app-4);
+    border-bottom: var(--app-border);
+  }
+  .filters { display: grid; grid-template-columns: 1fr; gap: var(--app-3); align-items: end; }
+  @media (min-width: 48em) { .filters { grid-template-columns: 2fr 2fr 1fr auto; } }
+  .filters__actions { display: flex; align-items: center; gap: var(--app-3); }
+  .stats {
+    display: grid; grid-template-columns: 1fr; gap: var(--app-4); padding: var(--app-4);
+    border: var(--app-border); background: var(--app-surface);
+  }
+  @media (min-width: 64em) { .stats { grid-template-columns: repeat(4, 1fr); } }
+  .stat { display: flex; flex-direction: column; gap: var(--app-1); }
+  .stat__label { font-size: var(--app-text-xs); text-transform: uppercase; letter-spacing: 0.06em; color: var(--color-text-muted); }
+  .stat__big { font-size: var(--size-heading); font-weight: var(--font-weight-medium); line-height: 1.1; font-variant-numeric: tabular-nums; }
+  .nowrap { white-space: nowrap; }
+  a.badge { text-decoration: none; }
+</style>

@@ -1,0 +1,222 @@
+---
+import App from '../layouts/App.astro';
+import { db, fromMinorUnits, rows as sqlRows } from '../lib/db/index.ts';
+import { pageHref, paginate, readPageParams } from '../lib/paginate.ts';
+import Pagination from '../components/Pagination.astro';
+import { formatDuration, formatHours, formatMoney } from '../lib/format.ts';
+import { readSettings } from '../lib/settings.ts';
+import { BUDGET_BY, type BudgetBy } from '../lib/harvest/constants.ts';
+
+const user = Astro.locals.user!;
+const isAdmin = user.role === 'admin';
+const showArchived = Astro.url.searchParams.get('archived') === '1';
+const query = (Astro.url.searchParams.get('q') ?? '').trim();
+const clientId = Number(Astro.url.searchParams.get('client')) || 0;
+
+/** This page's query string with some parameters changed; null removes one. Paging resets. */
+const href = (changes: Record<string, string | number | null>) =>
+  pageHref(Astro.url, { page: null, ...changes });
+
+interface ProjectRow {
+  id: number;
+  name: string;
+  code: string | null;
+  notes: string | null;
+  client_id: number;
+  client_name: string;
+  hourly_rate: number | null;
+  is_billable: number;
+  is_fixed_fee: number;
+  fee: number | null;
+  budget_by: string | null;
+  budget_seconds: number | null;
+  budget_amount: number | null;
+  budget_is_monthly: number;
+  is_active: number;
+  entries: number;
+  seconds: number;
+  /** Hours counting toward the budget: lifetime, or this month when the budget resets. */
+  budget_used: number;
+}
+
+// A mature account has thousands of projects, most of them archived — a plain list is
+// useless, so this searches name, code and client, and defaults to active only.
+const { page: pageNo, perPage } = readPageParams(Astro.url);
+const WHERE = `(? = 1 OR p.is_active = 1)
+          AND (? = 0 OR p.client_id = ?)
+          AND (? = '' OR p.name LIKE '%' || ? || '%'
+                      OR IFNULL(p.code, '') LIKE '%' || ? || '%'
+                      OR c.name LIKE '%' || ? || '%')`;
+const args = [showArchived ? 1 : 0, clientId, clientId, query, query, query, query];
+const total = (db().prepare(`SELECT COUNT(*) n FROM projects p JOIN clients c ON c.id = p.client_id WHERE ${WHERE}`).get(...args) as { n: number }).n;
+const pageInfo = paginate(total, pageNo, perPage);
+
+const projects = sqlRows<ProjectRow>(
+  db()
+    .prepare(
+      `SELECT p.id, p.name, p.code, p.notes, p.client_id, c.name AS client_name,
+              p.hourly_rate, p.is_billable, p.is_fixed_fee, p.fee, p.is_active,
+              p.budget_by, p.budget_seconds, p.budget_amount, p.budget_is_monthly,
+              COUNT(te.id) AS entries, COALESCE(SUM(te.duration_seconds), 0) AS seconds,
+              -- A monthly budget is this month's budget; counting all of history against it
+              -- would show every long-running project as hopelessly over.
+              COALESCE(SUM(CASE WHEN p.budget_is_monthly = 1
+                                 AND te.spent_date < date('now', 'start of month')
+                                THEN 0 ELSE te.duration_seconds END), 0) AS budget_used
+         FROM projects p
+         JOIN clients c ON c.id = p.client_id
+    LEFT JOIN time_entries te ON te.project_id = p.id
+        WHERE ${WHERE}
+     GROUP BY p.id
+     ORDER BY p.is_active DESC, seconds DESC, c.name, p.name
+        LIMIT ? OFFSET ?`,
+    )
+    .all(...args, pageInfo.perPage, pageInfo.offset),
+);
+
+// Only clients with a project in the current scope: there are hundreds of them, most long
+// gone, and a select that mostly leads to empty pages is a select nobody uses. The one already chosen
+// stays listed even when it has nothing to show, so the filter can always be seen and undone.
+const clients = sqlRows<{ id: number; name: string }>(
+  db()
+    .prepare(
+      `SELECT c.id, c.name FROM clients c
+        WHERE c.id = ? OR EXISTS (SELECT 1 FROM projects p WHERE p.client_id = c.id AND (? = 1 OR p.is_active = 1))
+     ORDER BY c.name`,
+    )
+    .all(clientId, showArchived ? 1 : 0),
+);
+const selectedClient = clients.find((c) => c.id === clientId) ?? null;
+
+const settings = readSettings(db());
+
+/** Hours on screen, with the account's decimal symbol. */
+const hours = (seconds: number) => formatHours(seconds, settings);
+const shown = (minor: number | null) =>
+  minor === null ? '—' : `${formatMoney(minor, settings)} ${settings.currency}`;
+
+/** An hours budget is the only one a single bar can honestly represent. */
+function hoursBudget(p: ProjectRow): { total: number; used: number; percent: number } | null {
+  const kind = (p.budget_by ?? 'none') as BudgetBy;
+  if (BUDGET_BY[kind]?.unit !== 'hours' || !p.budget_seconds) return null;
+  return {
+    total: p.budget_seconds,
+    used: p.budget_used,
+    percent: Math.round((p.budget_used / p.budget_seconds) * 100),
+  };
+}
+
+
+---
+
+<App title="Projects" current="projects">
+  <div class="row row--between mb-3 wrap">
+    <h1 class="page-title">Projects</h1>
+    {/* Filters and the primary action share the right-hand side: space-between with three
+        children would otherwise strand the button in the middle of the row. */}
+    <div class="row gap-3 wrap push">
+    <form method="get" action="/projects" class="row gap-2 wrap">
+      {showArchived && <input type="hidden" name="archived" value="1" />}
+      <label class="visually-hidden" for="client">Client</label>
+      <select class="field w-auto" id="client" name="client">
+        <option value="">All clients</option>
+        {clients.map((c) => (
+          <option value={c.id} selected={c.id === clientId}>{c.name}</option>
+        ))}
+      </select>
+      <label class="visually-hidden" for="q">Search projects</label>
+      <input class="field w-lg" id="q" name="q" value={query} placeholder="Search name or code" />
+      <button class="btn btn--secondary" type="submit">Search</button>
+      {(clientId !== 0 || query) && <a class="small" href={href({ client: null, q: null })}>Clear</a>}
+      <a class="small" href={href({ archived: showArchived ? null : 1 })}>
+        {showArchived ? 'Hide archived' : 'Show archived'}
+      </a>
+    </form>
+    {isAdmin && <a class="btn" href="/projects/new">New project</a>}
+    </div>
+  </div>
+
+
+  <div class="table-wrap">
+    <table class="table table--banded">
+      <thead>
+        <tr>
+          <th scope="col">Code</th>
+          <th scope="col">Project</th>
+          <th scope="col">Client</th>
+          <th scope="col" class="num">Rate</th>
+          <th scope="col" class="num">Hours</th>
+          <th scope="col">Budget</th>
+          <th scope="col">Status</th>
+          {isAdmin && <th scope="col"><span class="visually-hidden">Edit</span></th>}
+        </tr>
+      </thead>
+      <tbody>
+        {projects.length === 0 && (
+          <tr><td colspan="7" class="muted empty">
+            {query
+              ? <>Nothing matches “{query}”{selectedClient ? ` for ${selectedClient.name}` : ''}.</>
+              : selectedClient
+                ? <>No {showArchived ? '' : 'active '}projects for {selectedClient.name}.</>
+                : 'No projects.'}
+          </td></tr>
+        )}
+        {projects.map((p) => (
+          <tr class:list={[{ 'is-locked': !p.is_active }]}>
+            <td class="xs muted">{p.code ?? '—'}</td>
+            <td class="medium"><a href={`/projects/${p.id}`}>{p.name}</a></td>
+            <td class="small"><a class="muted" href={href({ client: p.client_id })}>{p.client_name}</a></td>
+            <td class="num small">{p.hourly_rate ? fromMinorUnits(p.hourly_rate)?.toFixed(2) : '—'}</td>
+            <td class="num">{formatDuration(p.seconds)}</td>
+            <td class="budget-cell small">
+              {(() => {
+                const b = hoursBudget(p);
+                if (b) return (
+                  <>
+                    <span class:list={['nowrap', { over: b.percent > 100 }]}>
+                      {hours(b.used)} / {hours(b.total)} h ({b.percent}%)
+                    </span>
+                    <span class="bar" aria-hidden="true">
+                      <span class:list={[{ over: b.percent > 100 }]}
+                            style={`--bar-fill:${Math.min(100, b.percent)}%`}></span>
+                    </span>
+                    {p.budget_is_monthly === 1 && <span class="xs muted resets">this month</span>}
+                  </>
+                );
+                if (p.budget_amount !== null) return <span class="nowrap">{shown(p.budget_amount)}</span>;
+                if (p.is_fixed_fee === 1) return <span class="nowrap muted">Fee {shown(p.fee)}</span>;
+                return <span class="muted">—</span>;
+              })()}
+            </td>
+            <td>
+              {p.is_active
+                ? <span class={`badge ${p.is_billable ? 'badge--billable' : ''}`}>{p.is_billable ? 'Billable' : 'Non-billable'}</span>
+                : <span class="badge badge--locked">Archived</span>}
+            </td>
+            {isAdmin && <td class="num"><a class="small" href={`/projects/${p.id}`}>Edit</a></td>}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <Pagination page={pageInfo} url={Astro.url} label="projects" />
+
+
+</App>
+
+<style>
+  .budget-cell { min-width: 11rem; }
+  .nowrap { white-space: nowrap; }
+  .over { color: var(--color-warning); }
+  .bar {
+    display: block;
+    height: 0.3125rem;
+    margin-top: 0.1875rem;
+    background: var(--app-surface-sunken);
+    border: var(--app-border);
+  }
+  .bar > span { display: block; height: 100%; width: var(--bar-fill, 0%); background: var(--color-green-evening); }
+  .bar > span.over { background: var(--color-warning); }
+  .resets { display: block; }
+</style>

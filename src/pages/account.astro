@@ -1,0 +1,79 @@
+---
+import App from '../layouts/App.astro';
+import { actions } from 'astro:actions';
+import { db, row as sqlRow } from '../lib/db/index.ts';
+
+// Every signed-in user has an account page — the one place a member can maintain their own
+// details, since editing people otherwise lives behind the admin-only Team pages.
+const viewer = Astro.locals.user!;
+
+const profile = Astro.getActionResult(actions.saveProfile);
+const password = Astro.getActionResult(actions.changePassword);
+
+const database = db();
+// The session carries a combined name; the form needs the two fields on their own.
+const me = sqlRow<{ first_name: string; last_name: string; email: string }>(
+  database.prepare('SELECT first_name, last_name, email FROM users WHERE id = ?').get(viewer.id),
+)!;
+---
+
+<App title="Account" current="account">
+  <h1 class="page-title mb-4">Your account</h1>
+
+  <div class="account-grid">
+    <section>
+      <h2 class="section-title">Details</h2>
+      {profile?.error && <p class="alert mb-4" role="alert">{profile.error.message}</p>}
+      {profile?.data?.ok && <p class="note mb-4" role="status">Saved.</p>}
+      <form method="POST" action={actions.saveProfile} class="stack panel">
+        <div class="row gap-3 top">
+          <div class="grow">
+            <label class="small" for="first">First name</label>
+            <input class="field" id="first" name="first_name" value={me.first_name} autocomplete="given-name" />
+          </div>
+          <div class="grow">
+            <label class="small" for="last">Last name</label>
+            <input class="field" id="last" name="last_name" value={me.last_name} autocomplete="family-name" />
+          </div>
+        </div>
+        <div>
+          <label class="small" for="email">Email</label>
+          <input class="field" id="email" name="email" type="email" required value={me.email} autocomplete="email" />
+          <p class="xs muted mt-1">You sign in with this address.</p>
+        </div>
+        <div class="row">
+          <button class="btn" type="submit">Save details</button>
+        </div>
+      </form>
+    </section>
+
+    <section>
+      <h2 class="section-title">Password</h2>
+      {password?.error && <p class="alert mb-4" role="alert">{password.error.message}</p>}
+      {password?.data?.ok && <p class="note mb-4" role="status">Password changed. Your other devices were signed out.</p>}
+      <form method="POST" action={actions.changePassword} class="stack panel">
+        <div>
+          <label class="small" for="current">Current password</label>
+          <input class="field" id="current" name="current" type="password" required autocomplete="current-password" />
+        </div>
+        <div>
+          <label class="small" for="next">New password</label>
+          <input class="field" id="next" name="next" type="password" required autocomplete="new-password" />
+          <p class="xs muted mt-1">Changing it signs you out on every other device.</p>
+        </div>
+        <div>
+          <label class="small" for="confirm">Confirm new password</label>
+          <input class="field" id="confirm" name="confirm" type="password" required autocomplete="new-password" />
+        </div>
+        <div class="row">
+          <button class="btn" type="submit">Change password</button>
+        </div>
+      </form>
+    </section>
+  </div>
+</App>
+
+<style>
+  .account-grid { display: grid; grid-template-columns: 1fr; gap: var(--app-5); }
+  @media (min-width: 64em) { .account-grid { grid-template-columns: 1fr 1fr; } }
+</style>

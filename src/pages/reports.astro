@@ -1,0 +1,531 @@
+---
+import App from '../layouts/App.astro';
+import { db, fromMinorUnits, row as sqlRow, rows as sqlRows } from '../lib/db/index.ts';
+import { readSettings } from '../lib/settings.ts';
+import { daysInclusive, formatDuration, formatHours, formatMoney, todayIso } from '../lib/format.ts';
+import {
+  readTimeframe,
+  step,
+  TIMEFRAME_KINDS,
+  TIMEFRAME_LABELS,
+  type TimeframeKind,
+} from '../lib/timeframe.ts';
+
+const viewer = Astro.locals.user!;
+const database = db();
+const settings = readSettings(database);
+
+/** Hours on screen, with the account's decimal symbol. */
+const hours = (seconds: number) => formatHours(seconds, settings);
+const privileged = viewer.role === 'admin' || viewer.role === 'manager';
+
+const bounds = sqlRow<{ first: string | null; last: string | null }>(
+  database.prepare('SELECT MIN(spent_date) AS first, MAX(spent_date) AS last FROM time_entries').get(),
+) ?? { first: null, last: null };
+
+const options = {
+  weekStartDay: settings.weekStartDay,
+  fiscalYearStart: settings.fiscalYearStart,
+  bounds,
+};
+const frame = readTimeframe(Astro.url, options);
+
+// Members only ever see themselves, whatever the URL says.
+const requestedUser = Number(Astro.url.searchParams.get('user_id'));
+const scopeUser = privileged
+  ? Number.isInteger(requestedUser) && requestedUser > 0 ? requestedUser : null
+  : viewer.id;
+const scopeClient = Number(Astro.url.searchParams.get('client_id')) || null;
+
+const TABS = {
+  clients: { label: 'Clients', sql: 'c.name', id: 'c.id', param: 'client' },
+  projects: {
+    label: 'Projects',
+    sql: "CASE WHEN p.code IS NULL THEN p.name ELSE '[' || p.code || '] ' || p.name END",
+    id: 'p.id',
+    param: 'project',
+  },
+  tasks: { label: 'Tasks', sql: 't.name', id: 't.id', param: 'task' },
+  users: { label: 'Teammates', sql: "TRIM(u.first_name || ' ' || u.last_name)", id: 'u.id', param: 'user' },
+} as const;
+type Tab = keyof typeof TABS;
+
+// Scoped to one person, "Teammates" would be a tab with a single row and "Clients" is a level
+// most people do not want there, so Harvest shows only Projects and Tasks. Follow it.
+const scopedToUser = privileged
+  ? Number.isInteger(Number(Astro.url.searchParams.get('user_id'))) &&
+    Number(Astro.url.searchParams.get('user_id')) > 0
+  : false;
+const TAB_KEYS = (scopedToUser ? ['projects', 'tasks'] : ['clients', 'projects', 'tasks', 'users']) as Tab[];
+
+const rawTab = Astro.url.searchParams.get('tab') as Tab | null;
+const tab: Tab =
+  rawTab && TAB_KEYS.includes(rawTab) ? rawTab : scopedToUser ? 'projects' : 'clients';
+
+const where = ['te.spent_date >= ?', 'te.spent_date <= ?'];
+const args: (string | number)[] = [frame.from, frame.to];
+if (scopeUser !== null) { where.push('te.user_id = ?'); args.push(scopeUser); }
+if (scopeClient !== null) { where.push('p.client_id = ?'); args.push(scopeClient); }
+const clause = where.join(' AND ');
+
+const JOINS = `
+    FROM time_entries te
+    JOIN users u ON u.id = te.user_id
+    JOIN projects p ON p.id = te.project_id
+    JOIN clients c ON c.id = p.client_id
+    JOIN tasks t ON t.id = te.task_id`;
+
+// Billable amount is rate × rounded hours, using the rate recorded on the entry rather than a
+// re-derivation from today's rates.
+//
+// Fixed-fee projects are excluded by default, which is what Harvest does: on a fixed fee the
+// revenue is the fee, so counting the hours at their rate would book the same work twice.
+// The exclusion is applied before the sum rather than after, and the result was verified
+// against the source system's own report for the same month.
+//
+// The toggle exists because the other number answers a different question: what
+// the fixed-fee work would have been worth on the clock, which is how you tell whether a
+// fixed price was a good one.
+const includeFixedFee = Astro.url.searchParams.get('fixed') === '1';
+// A CSV export does not say which projects are fixed fee, so after a CSV import none are,
+// and the toggle below changes nothing. Said beside it rather than left to look broken.
+const fixedFeeUnknown = !sqlRow<{ n: number }>(database.prepare('SELECT 1 AS n FROM projects WHERE is_fixed_fee = 1 LIMIT 1').get())
+  && Boolean(sqlRow<{ n: number }>(database.prepare("SELECT 1 AS n FROM time_entries WHERE source_key LIKE 'harvest-csv:%' LIMIT 1").get()));
+const BILLABLE =
+  'te.billable = 1 AND te.billable_rate IS NOT NULL' + (includeFixedFee ? '' : ' AND p.is_fixed_fee = 0');
+
+// Uninvoiced amount always excludes fixed-fee work, toggle or no toggle — Harvest says so on
+// the card itself ("Excludes Fixed Fee projects"), and it is right to: a fixed fee is invoiced
+// as a fee, so hours on one were never going to appear on an invoice as hours.
+const UNINVOICED = 'te.billable = 1 AND te.billable_rate IS NOT NULL AND p.is_fixed_fee = 0';
+const AMOUNT = `SUM(CASE WHEN ${BILLABLE}
+                         THEN te.billable_rate * te.rounded_seconds / 3600.0 ELSE 0 END)`;
+
+interface Summary {
+  seconds: number;
+  billable_seconds: number;
+  amount: number;
+  uninvoiced: number;
+}
+const summary = sqlRow<Summary>(
+  database
+    .prepare(
+      `SELECT COALESCE(SUM(te.rounded_seconds), 0) AS seconds,
+              COALESCE(SUM(CASE WHEN te.billable = 1 THEN te.rounded_seconds ELSE 0 END), 0) AS billable_seconds,
+              COALESCE(${AMOUNT}, 0) AS amount,
+              COALESCE(SUM(CASE WHEN ${UNINVOICED} AND te.is_billed = 0
+                                THEN te.billable_rate * te.rounded_seconds / 3600.0 ELSE 0 END), 0) AS uninvoiced
+       ${JOINS} WHERE ${clause}`,
+    )
+    .get(...args),
+) ?? { seconds: 0, billable_seconds: 0, amount: 0, uninvoiced: 0 };
+
+const billablePercent = summary.seconds
+  ? Math.round((summary.billable_seconds / summary.seconds) * 100)
+  : 0;
+
+// Every column sorts. `label COLLATE NOCASE` so "Ådalen" does not land after "Zetterberg",
+// and the direction is part of the URL so a sorted report stays shareable.
+const SORTS = {
+  name: 'label COLLATE NOCASE',
+  hours: 'seconds',
+  billable: 'billable_seconds',
+  share: 'CASE WHEN seconds > 0 THEN billable_seconds * 1.0 / seconds ELSE 0 END',
+  utilization: 'CASE WHEN capacity_seconds > 0 THEN seconds * 1.0 / capacity_seconds ELSE 0 END',
+  amount: 'amount',
+} as const;
+type SortKey = keyof typeof SORTS;
+
+const rawSort = Astro.url.searchParams.get('sort') as SortKey | null;
+const sort: SortKey =
+  rawSort && Object.hasOwn(SORTS, rawSort) && (rawSort !== 'utilization' || tab === 'users')
+    ? rawSort
+    : 'hours';
+const descending = (Astro.url.searchParams.get('dir') ?? (sort === 'name' ? 'asc' : 'desc')) !== 'asc';
+
+interface Row {
+  bucket_id: number;
+  label: string;
+  seconds: number;
+  billable_seconds: number;
+  amount: number;
+  capacity_seconds: number | null;
+}
+const rows = sqlRows<Row>(
+  database
+    .prepare(
+      `SELECT ${TABS[tab].id} AS bucket_id, ${TABS[tab].sql} AS label,
+              SUM(te.rounded_seconds) AS seconds,
+              SUM(CASE WHEN te.billable = 1 THEN te.rounded_seconds ELSE 0 END) AS billable_seconds,
+              ${AMOUNT} AS amount,
+              ${tab === 'users' ? 'MAX(u.weekly_capacity_seconds)' : 'NULL'} AS capacity_seconds
+       ${JOINS}
+        WHERE ${clause}
+     GROUP BY bucket_id, label
+     ORDER BY ${SORTS[sort]} ${descending ? 'DESC' : 'ASC'}, label COLLATE NOCASE`,
+    )
+    .all(...args),
+);
+
+const maxSeconds = rows.reduce((m, r) => Math.max(m, r.seconds), 0);
+
+// Utilisation is tracked hours against capacity for the period. Capacity is each person's
+// weekly capacity scaled by how many weeks the range spans — no assumption about which days
+// are working days, because a four-day week or a Sunday-to-Thursday week would make one wrong.
+const rangeWeeks = daysInclusive(frame.from, frame.to) / 7;
+
+// The SQL sums rate × hours, so the value is already in minor units.
+const money = (minorUnits: number) => formatMoney(minorUnits ?? 0, settings);
+
+const query = (extra: Record<string, string | number | null> = {}) => {
+  const params = new URLSearchParams({
+    kind: frame.kind, from: frame.from, till: frame.to, tab,
+    sort, dir: descending ? 'desc' : 'asc',
+  });
+  if (includeFixedFee) params.set('fixed', '1');
+  if (scopeUser !== null) params.set('user_id', String(scopeUser));
+  if (scopeClient !== null) params.set('client_id', String(scopeClient));
+  for (const [k, v] of Object.entries(extra)) {
+    if (v === null) params.delete(k);
+    else params.set(k, String(v));
+  }
+  return params.toString();
+};
+
+const detailQuery = (extra: Record<string, string | number> = {}) => {
+  const params = new URLSearchParams({ from: frame.from, to: frame.to });
+  if (scopeUser !== null) params.set('user', String(scopeUser));
+  if (scopeClient !== null) params.set('client', String(scopeClient));
+  for (const [k, v] of Object.entries(extra)) params.set(k, String(v));
+  return params.toString();
+};
+
+const previous = step(frame, -1, options);
+const next = step(frame, 1, options);
+const today = todayIso();
+
+// Clicking the active column flips direction; clicking another starts from its natural one —
+// names ascending, numbers descending.
+const sortHref = (key: SortKey) =>
+  `/reports?${query({ sort: key, dir: key === sort ? (descending ? 'asc' : 'desc') : key === 'name' ? 'asc' : 'desc' })}`;
+const ariaSort = (key: SortKey) => (key === sort ? (descending ? 'descending' : 'ascending') : 'none');
+
+const scopedClientName = scopeClient
+  ? sqlRow<{ name: string }>(database.prepare('SELECT name FROM clients WHERE id = ?').get(scopeClient))?.name
+  : null;
+
+// There is no person picker: the Teammates tab already lists everyone, and clicking a name
+// scopes the report to them. A dropdown would be a second way to do the same thing, with the
+// tab left showing something the dropdown disagreed with.
+const scopedUserName = scopeUser
+  ? sqlRow<{ name: string }>(
+      database
+        .prepare("SELECT TRIM(first_name || ' ' || last_name) AS name FROM users WHERE id = ?")
+        .get(scopeUser),
+    )?.name
+  : null;
+---
+
+<App title="Reports" current="reports">
+  <header class="tf">
+    <div class="row gap-2 wrap">
+      {frame.steppable && (
+        <div class="joined">
+          <a class="btn btn--secondary" href={`/reports?${query({ from: previous.from, till: previous.to })}`} aria-label="Previous date range">‹</a>
+          <a class="btn btn--secondary" href={`/reports?${query({ from: next.from, till: next.to })}`} aria-label="Next date range">›</a>
+        </div>
+      )}
+      <h1 class="page-title">{frame.label}</h1>
+      {frame.canReturn && (
+        <a class="small" href={`/reports?${query({ from: today })}`}>
+          Return to this {frame.kind}
+        </a>
+      )}
+      <span class="badge" title={`Hours rounded to nearest ${settings.roundToHours * 60} minutes`}>Rounded</span>
+    </div>
+
+    <form method="get" class="row gap-2 wrap">
+      <input type="hidden" name="tab" value={tab} />
+      <input type="hidden" name="from" value={frame.from} />
+      <input type="hidden" name="till" value={frame.to} />
+      {scopeClient !== null && <input type="hidden" name="client_id" value={scopeClient} />}
+      {scopeUser !== null && privileged && <input type="hidden" name="user_id" value={scopeUser} />}
+
+      <select class="field w-auto" name="kind" aria-label="Timeframe">
+        {TIMEFRAME_KINDS.filter((k) => k !== 'custom').map((k) => (
+          <option value={k} selected={k === frame.kind}>{TIMEFRAME_LABELS[k]}</option>
+        ))}
+      </select>
+      <button class="btn btn--secondary" type="submit">Apply</button>
+    </form>
+
+    {/* Any range, from one day to several years. Its own form, because a date typed here is
+        the range itself while the period picker above only uses `from` as an anchor. */}
+    <form method="get" class="row gap-2 wrap">
+      <input type="hidden" name="tab" value={tab} />
+      <input type="hidden" name="kind" value="custom" />
+      {scopeClient !== null && <input type="hidden" name="client_id" value={scopeClient} />}
+      {scopeUser !== null && privileged && <input type="hidden" name="user_id" value={scopeUser} />}
+      <input class="field w-auto" type="date" name="from" value={frame.from} required aria-label="From" />
+      <span class="small muted">to</span>
+      <input class="field w-auto" type="date" name="till" value={frame.to} required aria-label="To" />
+      <button class="btn btn--secondary" type="submit">Show range</button>
+    </form>
+  </header>
+
+  {/* Only for a drill-down someone chose. A member's report is scoped to them whatever the
+      URL says, so a crumb offering to clear it would be offering something that cannot
+      happen. */}
+  {scopedToUser && scopedUserName && (
+    <div class="crumb mb-4">
+      <p class="xs muted">
+        <a href={`/reports?${query({ user_id: null, tab: 'users' })}`}>Time report</a> /
+      </p>
+      <h2 class="page-title">{scopedUserName}</h2>
+    </div>
+  )}
+
+  {scopedClientName && (
+    <p class="small mb-3">
+      Filtered to <strong>{scopedClientName}</strong>.
+      <a class="ml-2" href={`/reports?${query({ client_id: null })}`}>Clear</a>
+    </p>
+  )}
+
+  <div class="stats mb-4">
+    <div class="stat">
+      <span class="stat__label">Total hours</span>
+      <span class="stat__big">{hours(summary.seconds)}</span>
+      <span class="xs muted">{formatDuration(summary.seconds)}</span>
+    </div>
+
+    <div class="stat">
+      <span class="stat__label">Billable</span>
+      <span class="stat__big">{hours(summary.billable_seconds)}</span>
+      <span class="xs muted">
+        {billablePercent}% of tracked · {hours(summary.seconds - summary.billable_seconds)} non-billable
+      </span>
+    </div>
+
+    <div class="stat">
+      <span class="stat__label">Billable amount</span>
+      <span class="stat__big">{money(summary.amount)} {settings.currency}</span>
+
+      {/* The toggle lives beside the number it changes, not up in the timeframe bar: it moves
+          this figure by a factor of three on this account, and a control that far from its
+          effect is a control nobody connects to the effect. */}
+      <form method="get" class="toggle">
+        {[...Astro.url.searchParams.entries()]
+          .filter(([key]) => key !== 'fixed')
+          .map(([key, value]) => <input type="hidden" name={key} value={value} />)}
+        <label class="row small gap-2">
+          <input type="checkbox" name="fixed" value="1" checked={includeFixedFee}
+                 onchange="this.form.submit()" />
+          Include fixed-fee projects
+        </label>
+        <noscript><button class="btn btn--quiet small mt-1" type="submit">Apply</button></noscript>
+      </form>
+      {fixedFeeUnknown ? (
+        <p class="xs alert mt-1" role="note">
+          No project is marked fixed fee, so this changes nothing. CSV exports do not say which
+          projects are: {viewer.role === 'admin' ? <a href="/import">get the settings from Harvest</a> : 'an administrator can get the settings from Harvest'},
+          or mark projects fixed fee on their page.
+        </p>
+      ) : (
+        <span class="xs muted">
+          Billable amounts for fixed-fee projects are based on billable rates, so the billable
+          amount may not match the invoiced amount.
+        </span>
+      )}
+    </div>
+
+    <div class="stat">
+      <span class="stat__label">Uninvoiced amount</span>
+      <span class="stat__big">{money(summary.uninvoiced)} {settings.currency}</span>
+      <span class="xs muted">
+        Billable time not yet marked billed. Excludes fixed-fee projects.
+      </span>
+    </div>
+  </div>
+
+  <nav class="tabs" role="tablist" aria-label="Group by">
+    {TAB_KEYS.map((key) => (
+      <a role="tab" class="tab" aria-selected={key === tab ? 'true' : 'false'}
+         href={`/reports?${query({ tab: key })}`}>{TABS[key].label}</a>
+    ))}
+    <span class="push row gap-2">
+      <a class="btn btn--secondary" href={`/log?${detailQuery()}`}>Log</a>
+      <a class="btn btn--secondary" href={`/export/time-entries?${detailQuery()}`}>Export</a>
+      <a class="btn btn--secondary" href={`/export/detailed-time.pdf?${detailQuery()}`}>PDF</a>
+    </span>
+  </nav>
+
+  <div class="table-wrap">
+    <table class="table table--banded">
+      <thead>
+        <tr>
+          <th scope="col" aria-sort={ariaSort('name')}>
+            <a href={sortHref('name')}>Name</a>
+          </th>
+          <th scope="col" class="num" aria-sort={ariaSort('hours')}>
+            <a href={sortHref('hours')}>Hours</a> <span class="unit">h</span>
+          </th>
+          <th scope="col" aria-sort={ariaSort('share')}>
+            <a href={sortHref('share')}>Billable %</a>
+          </th>
+          {tab === 'users' && (
+            <th scope="col" class="num" aria-sort={ariaSort('utilization')}>
+              <a href={sortHref('utilization')}>Utilization</a>
+            </th>
+          )}
+          <th scope="col" class="num" aria-sort={ariaSort('billable')}>
+            <a href={sortHref('billable')}>Billable hours</a> <span class="unit">h</span>
+          </th>
+          <th scope="col" class="num" aria-sort={ariaSort('amount')}>
+            <a href={sortHref('amount')}>Billable amount</a> <span class="unit">{settings.currency}</span>
+          </th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.length === 0 && (
+          <tr><td colspan="6" class="muted empty">No time tracked in this period.</td></tr>
+        )}
+        {rows.map((r) => {
+          const pct = r.seconds ? Math.round((r.billable_seconds / r.seconds) * 100) : 0;
+          const capacity = r.capacity_seconds ? r.capacity_seconds * rangeWeeks : 0;
+          return (
+            <tr>
+              <td class="medium">
+                {tab === 'clients'
+                  ? <a href={`/reports?${query({ client_id: r.bucket_id, tab: 'projects' })}`}>{r.label}</a>
+                  : tab === 'users'
+                    ? <a href={`/reports?${query({ user_id: r.bucket_id, tab: 'clients' })}`}>{r.label}</a>
+                    : r.label}
+              </td>
+              <td class="num">
+                <a href={`/log?${detailQuery({ [TABS[tab].param]: r.bucket_id })}`}
+                   title="See a detailed time report">{hours(r.seconds)}</a>
+              </td>
+              <td class="meter-cell">
+                {/* Two ratios, nothing more: how long this row's bar is against the longest,
+                    and how much of it is billable. The lengths are in the stylesheet. */}
+                <span class="meter" style={`--meter-share:${maxSeconds ? r.seconds / maxSeconds : 0}`}>
+                  <span class="meter__fill" style={`--meter-fill:${pct}%`}
+                        title={`Billable hours: ${pct}%`}></span>
+                </span>
+              </td>
+              {tab === 'users' && (
+                <td class:list={['num', { 'is-zero': !capacity }]}>{capacity ? `${Math.round((r.seconds / capacity) * 100)}%` : '—'}</td>
+              )}
+              <td class="num">
+                {hours(r.billable_seconds)} <span class="muted xs">({pct}%)</span>
+              </td>
+              <td class:list={['num', 'is-lead', { 'is-zero': !r.amount }]}>{r.amount ? money(r.amount) : '—'}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+      <tfoot>
+        <tr>
+          <td>Total</td>
+          <td class="num">{hours(summary.seconds)}</td>
+          <td></td>
+          {tab === 'users' && <td></td>}
+          <td class="num">{hours(summary.billable_seconds)}</td>
+          <td class="num is-lead">{money(summary.amount)}</td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+</App>
+
+<style>
+  .tf {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--app-3);
+    flex-wrap: wrap;
+    padding-bottom: var(--app-3);
+    margin-bottom: var(--app-4);
+    border-bottom: var(--app-border);
+  }
+
+  .stats {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--app-4);
+    padding: var(--app-4);
+    border: var(--app-border);
+    background: var(--app-surface);
+  }
+  @media (min-width: 64em) {
+    /* Hairlines rather than gap alone: four figures side by side have to be told apart
+       before they can be compared. */
+    .stats { grid-template-columns: repeat(4, 1fr); gap: 0; }
+    .stat { padding-inline: var(--app-5); }
+    .stat:first-child { padding-left: 0; }
+    .stat:last-child { padding-right: 0; }
+    .stat + .stat { border-left: var(--app-border); }
+  }
+  .stat { display: flex; flex-direction: column; gap: var(--app-1); }
+  .stat__label {
+    font-size: var(--app-text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text-muted);
+  }
+  .stat__big {
+    font-size: var(--size-heading);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.1;
+    letter-spacing: -0.022em;
+    font-variant-numeric: tabular-nums;
+  }
+  .toggle { margin: var(--app-1) 0; }
+  .crumb { display: grid; gap: 2px; }
+
+  .tabs {
+    display: flex;
+    align-items: center;
+    gap: var(--app-1);
+    border-bottom: var(--app-border);
+    margin-bottom: var(--app-3);
+  }
+  .tab {
+    padding: var(--app-2) var(--app-3);
+    text-decoration: none;
+    font-size: var(--app-text);
+    border-bottom: 2px solid transparent;
+    margin-bottom: -1px;
+  }
+  .tab[aria-selected='true'] {
+    border-bottom-color: var(--color-ink);
+    font-weight: var(--font-weight-medium);
+  }
+  .tab:hover { background: var(--app-surface-sunken); }
+
+  thead a { text-decoration: none; color: inherit; }
+  thead a:hover { text-decoration-line: underline; }
+  thead th[aria-sort='ascending'] a::after { content: ' ↑'; }
+  thead th[aria-sort='descending'] a::after { content: ' ↓'; }
+  thead th[aria-sort]:not([aria-sort='none']) a { color: var(--color-text); }
+
+  /* The track the bars are measured against, and the shortest a bar may be so that a row with
+     a few minutes on it is still a bar rather than nothing. */
+  .meter-cell { width: 8.75rem; }
+  .meter {
+    display: block;
+    height: 0.5rem;
+    width: max(var(--meter-min), calc(var(--meter-track) * var(--meter-share, 0)));
+    background: var(--color-green-morning);
+    --meter-track: 7.5rem;
+    --meter-min: 0.25rem;
+  }
+  .meter__fill {
+    display: block;
+    height: 100%;
+    width: var(--meter-fill, 0%);
+    background: var(--color-green-evening);
+  }
+</style>

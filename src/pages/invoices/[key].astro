@@ -1,0 +1,469 @@
+---
+/**
+ * One invoice, as Harvest recorded it: the lines, the payments against it, and the time
+ * entries that were billed on it. Read-only, by decision.
+ */
+import App from '../../layouts/App.astro';
+import { db, row as sqlRow, rows as sqlRows } from '../../lib/db/index.ts';
+import { formatDuration, formatHours, formatMoney } from '../../lib/format.ts';
+import { INVOICE_STATE, type InvoiceState } from '../../lib/harvest/constants.ts';
+import { readSettings } from '../../lib/settings.ts';
+
+const viewer = Astro.locals.user!;
+if (viewer.role === 'member') {
+  return new Response('Administrators and managers only.', { status: 403 });
+}
+
+// Addressed by id, which for an imported invoice is Harvest's own (migration 006) — so a link
+// that worked in Harvest works here. The invoice number is accepted too, because that is what
+// is printed on the paper and quoted by the client.
+const key = (Astro.params.key ?? '').trim();
+if (!key) return new Response('Not found', { status: 404 });
+const byId = /^\d+$/.test(key) ? Number(key) : -1;
+
+const database = db();
+const settings = readSettings(database);
+const money = (minor: number) => formatMoney(minor, settings);
+
+// Harvest's invoice report CSV has one row per invoice: totals, no lines, no payments, and no
+// link from the time report. An invoice from it is empty below for that reason, not because
+// it was empty in Harvest, and the page says so rather than claiming there were none.
+const CSV_GAP = 'Not in a CSV export. Import from the Harvest API to bring these in.';
+
+const invoice = sqlRow<{
+  id: number;
+  harvest_id: number | null;
+  source_key: string | null;
+  number: string;
+  state: InvoiceState;
+  subject: string | null;
+  purchase_order: string | null;
+  notes: string | null;
+  currency: string;
+  amount: number;
+  due_amount: number;
+  tax_rate: number | null;
+  tax_amount: number;
+  tax2_rate: number | null;
+  tax2_amount: number;
+  discount_rate: number | null;
+  discount_amount: number;
+  period_start: string | null;
+  period_end: string | null;
+  issue_date: string;
+  due_date: string | null;
+  payment_term: string | null;
+  sent_at: string | null;
+  paid_at: string | null;
+  paid_date: string | null;
+  closed_at: string | null;
+  creator_name: string | null;
+  client_id: number;
+  client: string;
+  created_at: string;
+  updated_at: string;
+}>(
+  database
+    .prepare(
+      `SELECT i.*, c.name AS client FROM invoices i JOIN clients c ON c.id = i.client_id
+        WHERE i.id = ? OR i.number = ?
+     ORDER BY i.id = ? DESC, i.issue_date DESC, i.id DESC LIMIT 1`,
+    )
+    .get(byId, key, byId),
+);
+
+if (!invoice) return new Response('Not found', { status: 404 });
+const invoiceId = invoice.id;
+
+const lines = sqlRows<{
+  id: number;
+  kind: string;
+  description: string | null;
+  quantity: number;
+  unit_price: number;
+  amount: number;
+  taxed: number;
+  project_id: number | null;
+  project_code: string | null;
+  project: string | null;
+}>(
+  database
+    .prepare(
+      `SELECT l.id, l.kind, l.description, l.quantity, l.unit_price, l.amount, l.taxed,
+              p.id AS project_id, p.code AS project_code, p.name AS project
+         FROM invoice_line_items l LEFT JOIN projects p ON p.id = l.project_id
+        WHERE l.invoice_id = ?
+     ORDER BY l.position`,
+    )
+    .all(invoiceId),
+);
+
+const payments = sqlRows<{
+  id: number;
+  amount: number;
+  paid_date: string | null;
+  paid_at: string | null;
+  recorded_by: string | null;
+  notes: string | null;
+  transaction_reference: string | null;
+  payment_gateway: string | null;
+}>(
+  database
+    .prepare(
+      `SELECT id, amount, paid_date, paid_at, recorded_by, notes, transaction_reference,
+              payment_gateway
+         FROM invoice_payments WHERE invoice_id = ?
+     ORDER BY COALESCE(paid_date, paid_at), id`,
+    )
+    .all(invoiceId),
+);
+
+// The hours this invoice billed. Rounded seconds, because that is what Harvest put on it.
+const billed = sqlRows<{
+      user_id: number;
+      person: string;
+      project_id: number;
+      project_code: string | null;
+      project: string;
+      entries: number;
+      seconds: number;
+      raw_seconds: number;
+    }>(
+      database
+        .prepare(
+          `SELECT u.id AS user_id, TRIM(u.first_name || ' ' || u.last_name) AS person,
+                  p.id AS project_id, p.code AS project_code, p.name AS project,
+                  COUNT(*) AS entries,
+                  SUM(te.rounded_seconds) AS seconds,
+                  SUM(te.duration_seconds) AS raw_seconds
+             FROM time_entries te
+             JOIN users u ON u.id = te.user_id
+             JOIN projects p ON p.id = te.project_id
+            WHERE te.invoice_id = ?
+         GROUP BY u.id, p.id
+         ORDER BY seconds DESC, person`,
+        )
+        .all(invoiceId),
+    );
+const messages = sqlRows<{ id: number; event_type: string | null; sent_by: string | null; recipients_json: string | null; subject: string | null; created_at: string }>(
+  database
+    .prepare('SELECT id, event_type, sent_by, recipients_json, subject, created_at FROM invoice_messages WHERE invoice_id = ? ORDER BY created_at, id')
+    .all(invoiceId),
+);
+const recipients = (json: string | null): string => {
+  try {
+    const list = JSON.parse(json ?? '[]') as { name?: string; email?: string }[];
+    return list.map((r) => r.name || r.email || '').filter(Boolean).join(', ');
+  } catch {
+    return '';
+  }
+};
+const billedTotal = billed.reduce(
+  (t, b) => ({ entries: t.entries + b.entries, seconds: t.seconds + b.seconds }),
+  { entries: 0, seconds: 0 },
+);
+
+const fromCsv = invoice.source_key?.startsWith('harvest-csv:') ?? false;
+const subtotal = lines.reduce((t, l) => t + l.amount, 0);
+const paid = invoice.amount - invoice.due_amount;
+
+/** 7.5 → "7,5", 3 → "3": a count, written with the account's decimal symbol. */
+const quantity = (value: number) =>
+  Number.isInteger(value) ? String(value) : String(value).replace('.', settings.decimalSymbol);
+
+const percent = (rate: number) =>
+  `${Number.isInteger(rate) ? rate : String(rate).replace('.', settings.decimalSymbol)} %`;
+
+const stamp = (iso: string | null) => (iso ? iso.replace('T', ' ').replace('Z', '') : null);
+
+const overdue = invoice.state === 'open' && invoice.due_date !== null
+  && invoice.due_date < new Date().toISOString().slice(0, 10);
+const cur = invoice.currency;
+---
+
+<App title={`Invoice #${invoice.number}`} current="invoices">
+  <p class="xs muted mb-2">
+    <a href="/invoices">Invoices</a> / #{invoice.number}
+  </p>
+
+  <div class="row row--between mb-2 wrap gap-3">
+    <h1 class="page-title">
+      Invoice #{invoice.number}
+      <span class="state ml-2">
+        {invoice.state === 'paid' && <span class="badge badge--billable">Paid</span>}
+        {invoice.state === 'open' && (overdue
+          ? <span class="badge badge--overdue">Overdue</span>
+          : <span class="badge">Open</span>)}
+        {invoice.state === 'draft' && <span class="badge">Draft</span>}
+        {invoice.state === 'closed' && <span class="badge badge--locked">Closed</span>}
+      </span>
+    </h1>
+    <span class="total">{money(invoice.amount)} {cur}</span>
+  </div>
+  <p class="small mb-4">
+    <a href={`/clients/${invoice.client_id}`}>{invoice.client}</a>
+    {invoice.subject && <span class="muted"> · {invoice.subject}</span>}
+  </p>
+
+  <div class="cols">
+    <section>
+      <h2 class="section-title">Details</h2>
+      <dl class="config">
+        <div><dt>Issued</dt><dd>{invoice.issue_date}</dd></div>
+        <div>
+          <dt>Due</dt>
+          <dd class:list={[{ overdue }]}>
+            {invoice.due_date ?? '—'}
+            {invoice.payment_term && <span class="muted"> ({invoice.payment_term})</span>}
+          </dd>
+        </div>
+        {invoice.period_start && (
+          <div><dt>Period</dt><dd>{invoice.period_start} – {invoice.period_end ?? '…'}</dd></div>
+        )}
+        {invoice.purchase_order && <div><dt>PO number</dt><dd>{invoice.purchase_order}</dd></div>}
+        <div><dt>Sent</dt><dd>{stamp(invoice.sent_at) ?? <span class="muted">not sent from Harvest</span>}</dd></div>
+        {invoice.paid_date && <div><dt>Paid</dt><dd>{invoice.paid_date}</dd></div>}
+        {invoice.closed_at && <div><dt>Closed</dt><dd>{stamp(invoice.closed_at)}</dd></div>}
+        <div><dt>Created by</dt><dd>{invoice.creator_name ?? <span class="muted">unknown</span>}</dd></div>
+        <div><dt>In Harvest</dt><dd class="muted">{invoice.harvest_id ?? '—'} · updated {stamp(invoice.updated_at)}</dd></div>
+      </dl>
+
+      {invoice.notes && (
+        <>
+          <h2 class="section-title mt-5">Notes</h2>
+          <p class="notes small">{invoice.notes}</p>
+        </>
+      )}
+    </section>
+
+    <section>
+      <h2 class="section-title">Lines</h2>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Item</th>
+              <th scope="col">Description</th>
+              <th scope="col">Project</th>
+              <th scope="col" class="num">Qty</th>
+              <th scope="col" class="num">Unit price</th>
+              <th scope="col" class="num">Amount</th>
+            </tr>
+          </thead>
+          <tbody>
+            {lines.length === 0 && (
+              <tr><td colspan="6" class="muted empty--sm">{fromCsv ? CSV_GAP : 'No lines on this invoice.'}</td></tr>
+            )}
+            {lines.map((l) => (
+              <tr>
+                <td class="xs nowrap">{l.kind}</td>
+                <td class="small">{l.description ?? <span class="muted">—</span>}</td>
+                <td class="xs">
+                  {l.project_id
+                    ? <a href={`/projects/${l.project_id}`}>
+                        {l.project_code && <span class="muted">[{l.project_code}] </span>}{l.project}
+                      </a>
+                    : <span class="muted">—</span>}
+                </td>
+                <td class="num">{quantity(l.quantity)}</td>
+                <td class="num">{money(l.unit_price)}</td>
+                <td class="num">{money(l.amount)}</td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td colspan="5" class="num muted">Subtotal</td>
+              <td class="num">{money(subtotal)}</td>
+            </tr>
+            {invoice.discount_amount !== 0 && (
+              <tr>
+                <td colspan="5" class="num muted">
+                  Discount{invoice.discount_rate !== null && ` (${percent(invoice.discount_rate)})`}
+                </td>
+                <td class="num">-{money(invoice.discount_amount)}</td>
+              </tr>
+            )}
+            {(invoice.tax_amount !== 0 || invoice.tax_rate !== null) && (
+              <tr>
+                <td colspan="5" class="num muted">
+                  Tax{invoice.tax_rate !== null && ` (${percent(invoice.tax_rate)})`}
+                </td>
+                <td class="num">{money(invoice.tax_amount)}</td>
+              </tr>
+            )}
+            {invoice.tax2_amount !== 0 && (
+              <tr>
+                <td colspan="5" class="num muted">
+                  Tax 2{invoice.tax2_rate !== null && ` (${percent(invoice.tax2_rate)})`}
+                </td>
+                <td class="num">{money(invoice.tax2_amount)}</td>
+              </tr>
+            )}
+            <tr>
+              <td colspan="5" class="num medium">Total</td>
+              <td class="num medium">{money(invoice.amount)} {cur}</td>
+            </tr>
+            {paid !== 0 && (
+              <>
+                <tr>
+                  <td colspan="5" class="num muted">Paid</td>
+                  <td class="num">-{money(paid)}</td>
+                </tr>
+                <tr>
+                  <td colspan="5" class="num medium">Unpaid</td>
+                  <td class="num medium">{money(invoice.due_amount)} {cur}</td>
+                </tr>
+              </>
+            )}
+          </tfoot>
+        </table>
+      </div>
+
+      <h2 class="section-title mt-5">Payments</h2>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Date</th>
+              <th scope="col" class="num">Amount</th>
+              <th scope="col">Recorded by</th>
+              <th scope="col">Reference</th>
+              <th scope="col">Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            {payments.length === 0 && (
+              <tr><td colspan="5" class="muted empty--sm">
+                {fromCsv
+                  ? CSV_GAP
+                  : invoice.state === 'paid'
+                    ? 'Marked paid in Harvest without a payment record.'
+                    : 'No payments recorded.'}
+              </td></tr>
+            )}
+            {payments.map((p) => (
+              <tr>
+                <td class="xs nowrap">{p.paid_date ?? stamp(p.paid_at) ?? '—'}</td>
+                <td class="num">{money(p.amount)}</td>
+                <td class="xs">{p.recorded_by ?? <span class="muted">—</span>}</td>
+                <td class="xs">
+                  {p.transaction_reference ?? <span class="muted">—</span>}
+                  {p.payment_gateway && <span class="muted"> · {p.payment_gateway}</span>}
+                </td>
+                <td class="xs muted">{p.notes ?? ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <h2 class="section-title mt-5">
+        Time billed
+        {billedTotal.entries > 0 && (
+          <span class="muted small">
+            ({formatDuration(billedTotal.seconds)} h · {billedTotal.entries} entries)
+          </span>
+        )}
+      </h2>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Person</th>
+              <th scope="col">Project</th>
+              <th scope="col" class="num">Entries</th>
+              <th scope="col" class="num">Hours</th>
+              <th scope="col" class="num">Decimal</th>
+            </tr>
+          </thead>
+          <tbody>
+            {billed.length === 0 && (
+              <tr><td colspan="5" class="muted empty--sm">
+                {fromCsv ? CSV_GAP : 'No time entries were billed on this invoice.'}
+              </td></tr>
+            )}
+            {billed.map((b) => (
+              <tr>
+                <td>{b.person}</td>
+                <td class="small">
+                  <a href={`/projects/${b.project_id}`}>
+                    {b.project_code && <span class="muted">[{b.project_code}] </span>}{b.project}
+                  </a>
+                </td>
+                <td class="num">{b.entries}</td>
+                <td class="num">{formatDuration(b.seconds)}</td>
+                <td class="num muted">{formatHours(b.seconds, settings)}</td>
+              </tr>
+            ))}
+          </tbody>
+          {billed.length > 1 && (
+            <tfoot>
+              <tr>
+                <td colspan="2" class="medium">Total</td>
+                <td class="num medium">{billedTotal.entries}</td>
+                <td class="num medium">{formatDuration(billedTotal.seconds)}</td>
+                <td class="num muted">{formatHours(billedTotal.seconds, settings)}</td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+      </div>
+      <p class="xs muted mt-2">
+        Rounded hours, as Harvest bills them. Locked entries stay locked because they are on
+        this invoice.
+      </p>
+
+      {/* A "send" with nobody on it is the invoice marked as sent by hand — this account's
+          paper goes out from the accounting system, and Harvest only ever learns that it did. */}
+      <h2 class="section-title mt-5">Sent from Harvest</h2>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">When</th>
+              <th scope="col">Event</th>
+              <th scope="col">By</th>
+              <th scope="col">To</th>
+              <th scope="col">Subject</th>
+            </tr>
+          </thead>
+          <tbody>
+            {messages.length === 0 && <tr><td colspan="5" class="muted empty--sm">Nothing was sent from Harvest.</td></tr>}
+            {messages.map((m) => (
+              <tr>
+                <td class="xs nowrap">{stamp(m.created_at)}</td>
+                <td class="xs">{m.event_type ?? '—'}</td>
+                <td class="xs">{m.sent_by ?? '—'}</td>
+                <td class="xs">{recipients(m.recipients_json) || <span class="muted">marked by hand</span>}</td>
+                <td class="xs muted">{m.subject ?? ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</App>
+
+<style>
+  .cols { display: grid; gap: var(--app-6); align-items: start; }
+  @media (min-width: 64em) { .cols { grid-template-columns: 22rem 1fr; } }
+
+  .state { vertical-align: middle; font-size: var(--app-text-sm); }
+  .total {
+    font-size: var(--size-heading);
+    font-weight: var(--font-weight-medium);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .config { display: grid; gap: var(--app-2); margin: 0; }
+  .config > div { display: grid; grid-template-columns: 7rem 1fr; gap: var(--app-2); align-items: baseline; }
+  .config dt { font-size: var(--app-text-sm); color: var(--color-text-muted); }
+  .config dd { margin: 0; font-size: var(--app-text-sm); word-break: break-word; }
+
+  .notes { white-space: pre-line; color: var(--color-text-soft); }
+  .nowrap { white-space: nowrap; }
+  .overdue { color: var(--color-warning); }
+  .badge--overdue { color: var(--color-warning); }
+</style>

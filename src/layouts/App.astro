@@ -1,0 +1,130 @@
+---
+import '../styles/tokens.css';
+import '../styles/base.css';
+import '../styles/app.css';
+
+
+interface Props {
+  title: string;
+  current?: 'time' | 'expenses' | 'reports' | 'log' | 'projects' | 'clients' | 'invoices' | 'estimates' | 'api' | 'docs' | 'tasks' | 'team' | 'import' | 'account';
+}
+
+const { title, current } = Astro.props;
+const user = Astro.locals.user;
+const isAdmin = user?.role === 'admin';
+// Invoices carry every rate in the account, so they sit with the reports' money figures:
+// administrators and managers see them, members do not.
+const seesMoney = isAdmin || user?.role === 'manager';
+
+// The menu label carries the current-page mark when the page inside it is the one open, so
+// a collapsed menu still shows where you are.
+const inAdmin = current === 'tasks' || current === 'import' || current === 'api' || current === 'docs';
+const inOther = current === 'expenses' || current === 'estimates';
+
+// Set by the middleware when a form posted to an action failed; see backToForm there.
+const actionError = Astro.url.searchParams.get('action_error');
+---
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title} · No BS Time Tracking</title>
+    <script is:inline>
+      document.documentElement.classList.remove('no-js');
+    </script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="app-header">
+        <div class="app-container app-header__inner">
+          <a class="app-brand" href="/">No BS Time Tracking</a>
+
+          <nav aria-label="Main">
+            <ul class="app-nav">
+              <li><a href="/" aria-current={current === 'time' ? 'page' : undefined}>Time</a></li>
+              <li><a href="/reports" aria-current={current === 'reports' ? 'page' : undefined}>Reports</a></li>
+              <li><a href="/log" aria-current={current === 'log' ? 'page' : undefined}>Log</a></li>
+              <li><a href="/projects" aria-current={current === 'projects' ? 'page' : undefined}>Projects</a></li>
+              <li><a href="/clients" aria-current={current === 'clients' ? 'page' : undefined}>Clients</a></li>
+              {seesMoney && (
+                <li><a href="/invoices" aria-current={current === 'invoices' ? 'page' : undefined}>Invoices</a></li>
+              )}
+              <li><a href="/team" aria-current={current === 'team' ? 'page' : undefined}>Team</a></li>
+
+              {/* Everything that is neither the daily work nor administering the instance.
+                  Expenses is everyone's — a member sees their own; estimates are money, so
+                  they follow the same rule as invoices. */}
+              <li class="app-nav__menu">
+                <details data-menu>
+                  <summary aria-current={inOther ? 'page' : undefined}>Other</summary>
+                  <ul class="app-menu">
+                    <li><a href="/expenses" aria-current={current === 'expenses' ? 'page' : undefined}>Expenses</a></li>
+                    {seesMoney && (
+                      <li><a href="/estimates" aria-current={current === 'estimates' ? 'page' : undefined}>Estimates</a></li>
+                    )}
+                  </ul>
+                </details>
+              </li>
+
+              {isAdmin && (
+                <li class="app-nav__menu">
+                  {/* details/summary: open, close and keyboard access come for free, and the
+                      menu still works with no JavaScript at all. The script below only adds
+                      the two dismissals browsers do not give <details> — clicking away and
+                      Escape — so losing it costs politeness, not function. */}
+                  <details data-menu>
+                    <summary aria-current={inAdmin ? 'page' : undefined}>Admin</summary>
+                    <ul class="app-menu">
+                      <li><a href="/tasks" aria-current={current === 'tasks' ? 'page' : undefined}>Tasks</a></li>
+                      <li><a href="/import" aria-current={current === 'import' ? 'page' : undefined}>Import</a></li>
+                      <li><a href="/tokens" aria-current={current === 'api' ? 'page' : undefined}>API access</a></li>
+                      <li><a href="/docs" aria-current={current === 'docs' ? 'page' : undefined}>API reference</a></li>
+                    </ul>
+                  </details>
+                </li>
+              )}
+            </ul>
+          </nav>
+
+          {user && (
+            <div class="row push gap-3">
+              <a class="app-account xs" href="/account"
+                 aria-current={current === 'account' ? 'page' : undefined}>
+                {user.name || user.email}
+                {user.role !== 'member' && <span class="badge ml-2">{user.role}</span>}
+              </a>
+              <form method="POST" action="/api/logout">
+                <button class="btn btn--quiet small" type="submit">Sign out</button>
+              </form>
+            </div>
+          )}
+        </div>
+      </header>
+
+      <main class="app-main">
+        <div class="app-container">
+          {actionError && <p class="alert mb-4" role="alert">{actionError}</p>}
+          <slot />
+        </div>
+      </main>
+    </div>
+
+    <script is:inline>
+      // Click away or press Escape to close the admin menu. Nothing here is load-bearing:
+      // without it the menu still opens and closes on its own summary.
+      for (const menu of document.querySelectorAll('[data-menu]')) {
+        document.addEventListener('click', (event) => {
+          if (menu.open && !menu.contains(event.target)) menu.open = false;
+        });
+        document.addEventListener('keydown', (event) => {
+          if (event.key === 'Escape' && menu.open) {
+            menu.open = false;
+            menu.querySelector('summary').focus();
+          }
+        });
+      }
+    </script>
+  </body>
+</html>

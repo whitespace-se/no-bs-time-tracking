@@ -1,0 +1,130 @@
+---
+/**
+ * Estimates, read from Harvest. Read-only, like invoices: the record of what was quoted,
+ * to whom, and whether it was accepted.
+ */
+import App from '../layouts/App.astro';
+import Pagination from '../components/Pagination.astro';
+import { db, row as sqlRow, rows as sqlRows } from '../lib/db/index.ts';
+import { formatCount, formatMoney } from '../lib/format.ts';
+import { paginate, pageHref, readPageParams } from '../lib/paginate.ts';
+import { readSettings } from '../lib/settings.ts';
+
+const viewer = Astro.locals.user!;
+if (viewer.role === 'member') {
+  return new Response('Administrators and managers only.', { status: 403 });
+}
+
+const database = db();
+const settings = readSettings(database);
+const money = (minor: number) => formatMoney(minor, settings);
+
+const STATES = { draft: 'Draft', sent: 'Sent', accepted: 'Accepted', declined: 'Declined' } as const;
+type State = keyof typeof STATES;
+const rawState = Astro.url.searchParams.get('state') ?? '';
+const state = (rawState in STATES ? rawState : '') as State | '';
+const clientId = Number(Astro.url.searchParams.get('client')) || 0;
+
+const WHERE = `(? = '' OR e.state = ?) AND (? = 0 OR e.client_id = ?)`;
+const args = [state, state, clientId, clientId];
+
+const total = sqlRow<{ n: number }>(
+  database.prepare(`SELECT COUNT(*) AS n FROM estimates e WHERE ${WHERE}`).get(...args),
+)?.n ?? 0;
+const { page: pageNo, perPage } = readPageParams(Astro.url);
+const pageInfo = paginate(total, pageNo, perPage);
+
+const estimates = sqlRows<{
+  id: number; number: string; state: State; subject: string | null; issue_date: string;
+  amount: number; currency: string; client_id: number; client: string; accepted_at: string | null;
+}>(
+  database
+    .prepare(
+      `SELECT e.id, e.number, e.state, e.subject, e.issue_date, e.amount, e.currency,
+              c.id AS client_id, c.name AS client, e.accepted_at
+         FROM estimates e JOIN clients c ON c.id = e.client_id
+        WHERE ${WHERE}
+     ORDER BY e.issue_date DESC, CAST(e.number AS INTEGER) DESC, e.number DESC
+        LIMIT ? OFFSET ?`,
+    )
+    .all(...args, pageInfo.perPage, pageInfo.offset),
+);
+
+const clients = sqlRows<{ id: number; name: string }>(
+  database
+    .prepare(
+      `SELECT c.id, c.name FROM clients c
+        WHERE EXISTS (SELECT 1 FROM estimates e WHERE e.client_id = c.id) ORDER BY c.name`,
+    )
+    .all(),
+);
+const href = (changes: Record<string, string | number | null>) => pageHref(Astro.url, { page: null, ...changes });
+const filtering = state !== '' || clientId !== 0;
+---
+
+<App title="Estimates" current="estimates">
+  <div class="row row--between mb-4 wrap gap-3">
+    <h1 class="page-title">
+      Estimates <span class="muted small">({formatCount(pageInfo.total, settings)})</span>
+    </h1>
+    {viewer.role === 'admin' && <a class="small" href="/export/estimates">Download CSV</a>}
+  </div>
+
+  <form method="get" class="row gap-2 wrap mb-4">
+    <select class="field w-auto" name="state" aria-label="State">
+      <option value="">Any state</option>
+      {(Object.keys(STATES) as State[]).map((k) => (
+        <option value={k} selected={k === state}>{STATES[k]}</option>
+      ))}
+    </select>
+    <select class="field w-auto" name="client" aria-label="Client">
+      <option value="">Any client</option>
+      {clients.map((c) => <option value={c.id} selected={c.id === clientId}>{c.name}</option>)}
+    </select>
+    <button class="btn" type="submit">Filter</button>
+    {filtering && <a class="small" href="/estimates">Clear</a>}
+  </form>
+
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th scope="col">Number</th>
+          <th scope="col">Client</th>
+          <th scope="col">Subject</th>
+          <th scope="col">Issued</th>
+          <th scope="col" class="num">Amount</th>
+          <th scope="col">State</th>
+        </tr>
+      </thead>
+      <tbody>
+        {estimates.length === 0 && (
+          <tr><td colspan="6" class="muted empty">
+            {filtering ? 'No estimates match.' : 'No estimates yet. They arrive with the Harvest import.'}
+          </td></tr>
+        )}
+        {estimates.map((e) => (
+          <tr class:list={[{ 'is-locked': e.state === 'declined' }]}>
+            <td class="medium nowrap"><a href={`/estimates/${e.id}`}>#{e.number}</a></td>
+            <td><a href={href({ client: e.client_id })}>{e.client}</a></td>
+            <td class="small muted">{e.subject ?? '—'}</td>
+            <td class="xs nowrap">{e.issue_date}</td>
+            <td class="num nowrap">{money(e.amount)}{e.currency !== settings.currency && <span class="xs muted"> {e.currency}</span>}</td>
+            <td class="xs">
+              {e.state === 'accepted' && <span class="badge badge--billable">Accepted</span>}
+              {e.state === 'sent' && <span class="badge">Sent</span>}
+              {e.state === 'draft' && <span class="muted">Draft</span>}
+              {e.state === 'declined' && <span class="badge badge--locked">Declined</span>}
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <Pagination page={pageInfo} url={Astro.url} label="estimates" />
+</App>
+
+<style>
+  .nowrap { white-space: nowrap; }
+</style>

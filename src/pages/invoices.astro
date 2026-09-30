@@ -1,0 +1,339 @@
+---
+/**
+ * Invoice history, read from Harvest.
+ *
+ * Nothing on this page or the one behind it creates, edits or numbers an invoice. That is
+ * deliberate: issuing invoices is accounting-law scope. What is here is the
+ * record — which invoice went to whom, for what, and what is still unpaid — so that a
+ * team leaving Harvest does not leave years of that behind.
+ */
+import App from '../layouts/App.astro';
+import Pagination from '../components/Pagination.astro';
+import { db, row as sqlRow, rows as sqlRows } from '../lib/db/index.ts';
+import { formatCount, formatMoney, todayIso } from '../lib/format.ts';
+import { INVOICE_STATE, type InvoiceState } from '../lib/harvest/constants.ts';
+import { paginate, pageHref, readPageParams } from '../lib/paginate.ts';
+import { readSettings } from '../lib/settings.ts';
+import {
+  readTimeframe,
+  resolve as resolveTimeframe,
+  step,
+  TIMEFRAME_KINDS,
+  TIMEFRAME_LABELS,
+} from '../lib/timeframe.ts';
+
+const viewer = Astro.locals.user!;
+if (viewer.role === 'member') {
+  return new Response('Administrators and managers only.', { status: 403 });
+}
+
+const database = db();
+const settings = readSettings(database);
+const money = (minor: number) => formatMoney(minor, settings);
+const today = todayIso();
+
+// Stepped through by issue date with the same control as the reports — ‹ › and a kind —
+// so "what did we invoice last quarter" is a click, not two date fields. Unlike the reports
+// this opens on all time: an invoice list is a register first and a period view second.
+const bounds = sqlRow<{ first: string | null; last: string | null }>(
+  database.prepare('SELECT MIN(issue_date) AS first, MAX(issue_date) AS last FROM invoices').get(),
+) ?? { first: null, last: null };
+const frameOptions = {
+  weekStartDay: settings.weekStartDay,
+  fiscalYearStart: settings.fiscalYearStart,
+  bounds,
+};
+const frame = Astro.url.searchParams.has('kind')
+  ? readTimeframe(Astro.url, frameOptions)
+  : resolveTimeframe('all', today, frameOptions);
+const previous = step(frame, -1, frameOptions);
+const next = step(frame, 1, frameOptions);
+
+const rawState = Astro.url.searchParams.get('state') ?? '';
+const state = (rawState in INVOICE_STATE ? rawState : '') as InvoiceState | '';
+const clientId = Number(Astro.url.searchParams.get('client')) || 0;
+const q = (Astro.url.searchParams.get('q') ?? '').trim();
+
+const WHERE = `i.issue_date BETWEEN ? AND ?
+   AND (? = '' OR i.state = ?)
+   AND (? = 0 OR i.client_id = ?)
+   AND (? = '' OR i.number LIKE ? OR i.subject LIKE ? OR c.name LIKE ?)`;
+const like = `%${q}%`;
+const args = [frame.from, frame.to, state, state, clientId, clientId, q, like, like, like];
+
+/** This page's query string with some parameters changed; null removes one. Paging resets. */
+const query = (changes: Record<string, string | number | null>) =>
+  pageHref(Astro.url, { kind: frame.kind, from: frame.from, till: null, page: null, ...changes });
+
+// The totals are in the account's currency and leave out anything invoiced in another one:
+// two EUR invoices added to an SEK sum is a number that means nothing. They stay in the list,
+// each with its own currency on its row, and the card says how many were left out.
+const summary = sqlRow<{ n: number; other: number; amount: number; outstanding: number; overdue: number }>(
+  database
+    .prepare(
+      `SELECT COUNT(*) AS n,
+              COALESCE(SUM(i.currency <> ?), 0) AS other,
+              COALESCE(SUM(CASE WHEN i.currency = ? THEN i.amount END), 0) AS amount,
+              COALESCE(SUM(CASE WHEN i.currency = ? AND i.state = 'open' THEN i.due_amount END), 0)
+                AS outstanding,
+              COALESCE(SUM(CASE WHEN i.currency = ? AND i.state = 'open' AND i.due_date < ?
+                                THEN i.due_amount END), 0) AS overdue
+         FROM invoices i JOIN clients c ON c.id = i.client_id
+        WHERE ${WHERE}`,
+    )
+    .get(settings.currency, settings.currency, settings.currency, settings.currency, today, ...args),
+) ?? { n: 0, other: 0, amount: 0, outstanding: 0, overdue: 0 };
+
+const { page: pageNo, perPage } = readPageParams(Astro.url);
+const pageInfo = paginate(summary.n, pageNo, perPage);
+
+interface InvoiceRow {
+  id: number;
+  number: string;
+  state: InvoiceState;
+  subject: string | null;
+  issue_date: string;
+  due_date: string | null;
+  amount: number;
+  due_amount: number;
+  currency: string;
+  client_id: number;
+  client: string;
+}
+
+// Newest first. Numbers are Harvest's, sequential in this account but text by contract, so
+// the tie-break sorts them as numbers where they are and as text where they are not.
+const invoices = sqlRows<InvoiceRow>(
+  database
+    .prepare(
+      `SELECT i.id, i.number, i.state, i.subject, i.issue_date, i.due_date, i.amount,
+              i.due_amount, i.currency, c.id AS client_id, c.name AS client
+         FROM invoices i JOIN clients c ON c.id = i.client_id
+        WHERE ${WHERE}
+     ORDER BY i.issue_date DESC, CAST(i.number AS INTEGER) DESC, i.number DESC
+        LIMIT ? OFFSET ?`,
+    )
+    .all(...args, pageInfo.perPage, pageInfo.offset),
+);
+
+// Only clients that have been invoiced: there are hundreds of them, and a filter listing the
+// ones with nothing behind them is a filter that mostly returns empty pages.
+const clients = sqlRows<{ id: number; name: string }>(
+  database
+    .prepare(
+      `SELECT c.id, c.name FROM clients c
+        WHERE EXISTS (SELECT 1 FROM invoices i WHERE i.client_id = c.id)
+     ORDER BY c.name`,
+    )
+    .all(),
+);
+
+const filtering = state !== '' || clientId !== 0 || q !== '';
+const timeframed = Astro.url.searchParams.has('kind') && frame.kind !== 'all';
+---
+
+<App title="Invoices" current="invoices">
+  <header class="tf">
+    <div class="row gap-2 wrap">
+      {frame.steppable && (
+        <div class="joined">
+          <a class="btn btn--secondary" href={query({ from: previous.from })} aria-label="Previous period">‹</a>
+          <a class="btn btn--secondary" href={query({ from: next.from })} aria-label="Next period">›</a>
+        </div>
+      )}
+      <h1 class="page-title">
+        {timeframed ? frame.label : 'Invoices'}
+        <span class="muted small"> ({formatCount(pageInfo.total, settings)})</span>
+      </h1>
+      {frame.canReturn && (
+        <a class="small" href={query({ from: today })}>Return to this {frame.kind}</a>
+      )}
+    </div>
+
+    <form method="get" class="row gap-2 wrap">
+      {/* `from` is the anchor: any day inside a period names the whole period, so switching
+          kind keeps you in the same stretch of the calendar. */}
+      <input type="hidden" name="from" value={frame.from} />
+      {state && <input type="hidden" name="state" value={state} />}
+      {clientId !== 0 && <input type="hidden" name="client" value={clientId} />}
+      {q && <input type="hidden" name="q" value={q} />}
+      <select class="field w-auto" name="kind" aria-label="Timeframe">
+        {TIMEFRAME_KINDS.filter((k) => k !== 'custom' && k !== 'week').map((k) => (
+          <option value={k} selected={k === frame.kind}>{TIMEFRAME_LABELS[k]}</option>
+        ))}
+      </select>
+      <button class="btn btn--secondary" type="submit">Apply</button>
+      {viewer.role === 'admin' && (
+        <a class="small ml-2" href="/export/invoices">Download CSV</a>
+      )}
+    </form>
+  </header>
+
+  <form method="get" class="filters mb-4">
+    {timeframed && (
+      <>
+        <input type="hidden" name="kind" value={frame.kind} />
+        <input type="hidden" name="from" value={frame.from} />
+      </>
+    )}
+    <div>
+      <label class="xs muted" for="q">Search</label>
+      <input class="field" id="q" name="q" value={q} placeholder="Number, subject or client" />
+    </div>
+    <div>
+      <label class="xs muted" for="state">State</label>
+      <select class="field" id="state" name="state">
+        <option value="">Any</option>
+        {(Object.keys(INVOICE_STATE) as InvoiceState[]).map((key) => (
+          <option value={key} selected={key === state}>{INVOICE_STATE[key]}</option>
+        ))}
+      </select>
+    </div>
+    <div>
+      <label class="xs muted" for="client">Client</label>
+      <select class="field" id="client" name="client">
+        <option value="">Any</option>
+        {clients.map((c) => (
+          <option value={c.id} selected={c.id === clientId}>{c.name}</option>
+        ))}
+      </select>
+    </div>
+    <div class="filters__actions">
+      <button class="btn" type="submit">Filter</button>
+      {filtering && <a class="small" href={query({ state: null, client: null, q: null })}>Clear</a>}
+    </div>
+  </form>
+
+  <div class="stats mb-4">
+    <div class="stat">
+      <span class="stat__label">Invoices</span>
+      <span class="stat__big">{formatCount(summary.n, settings)}</span>
+    </div>
+    <div class="stat">
+      <span class="stat__label">Invoiced</span>
+      <span class="stat__big">{money(summary.amount)} {settings.currency}</span>
+      {summary.other > 0 && (
+        <span class="xs muted">
+          Leaves out {summary.other} in another currency
+        </span>
+      )}
+    </div>
+    <div class="stat">
+      <span class="stat__label">Outstanding</span>
+      <span class="stat__big">{money(summary.outstanding)} {settings.currency}</span>
+      <span class="xs muted">Open invoices, unpaid part</span>
+    </div>
+    <div class="stat">
+      <span class="stat__label">Overdue</span>
+      <span class="stat__big">{money(summary.overdue)} {settings.currency}</span>
+      <span class="xs muted">Open and past due date</span>
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="table table--banded">
+      <thead>
+        <tr>
+          <th scope="col">Number</th>
+          <th scope="col">Client</th>
+          <th scope="col">Subject</th>
+          <th scope="col">Issued</th>
+          <th scope="col">Due</th>
+          <th scope="col" class="num">Amount <span class="unit">{settings.currency}</span></th>
+          <th scope="col" class="num">Unpaid <span class="unit">{settings.currency}</span></th>
+          <th scope="col">State</th>
+        </tr>
+      </thead>
+      <tbody>
+        {invoices.length === 0 && (
+          <tr><td colspan="8" class="muted empty">
+            {filtering || timeframed ? 'No invoices in this view.' : 'No invoices yet. They arrive with the Harvest import.'}
+          </td></tr>
+        )}
+        {invoices.map((i) => {
+          const overdue = i.state === 'open' && i.due_date !== null && i.due_date < today;
+          return (
+            <tr class:list={[{ 'is-locked': i.state === 'closed' }]}>
+              <td class="medium nowrap"><a href={`/invoices/${i.id}`}>#{i.number}</a></td>
+              <td><a href={query({ client: i.client_id })}>{i.client}</a></td>
+              <td class="small muted">{i.subject ?? '—'}</td>
+              <td class="xs nowrap">{i.issue_date}</td>
+              <td class="xs nowrap" class:list={[{ overdue }]}>{i.due_date ?? '—'}</td>
+              <td class="num nowrap is-lead">
+                {money(i.amount)}{i.currency !== settings.currency && <span class="unit">{i.currency}</span>}
+              </td>
+              <td class="num nowrap">
+                {i.state === 'open' || (i.state === 'draft' && i.due_amount !== i.amount)
+                  ? money(i.due_amount)
+                  : <span class="is-zero">—</span>}
+              </td>
+              <td class="xs">
+                {i.state === 'paid' && <span class="badge badge--billable">Paid</span>}
+                {i.state === 'open' && (overdue
+                  ? <span class="badge badge--overdue">Overdue</span>
+                  : <span class="badge">Open</span>)}
+                {i.state === 'draft' && <span class="muted">Draft</span>}
+                {i.state === 'closed' && <span class="badge badge--locked">Closed</span>}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  </div>
+
+  <Pagination page={pageInfo} url={Astro.url} label="invoices" />
+</App>
+
+<style>
+  .tf {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: var(--app-3);
+    flex-wrap: wrap;
+    padding-bottom: var(--app-3);
+    margin-bottom: var(--app-4);
+    border-bottom: var(--app-border);
+  }
+
+  .filters {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--app-3);
+    align-items: end;
+  }
+  @media (min-width: 48em) {
+    .filters { grid-template-columns: 2fr 1fr 2fr auto; }
+  }
+  .filters__actions { display: flex; align-items: center; gap: var(--app-3); }
+
+  .stats {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--app-4);
+    padding: var(--app-4);
+    border: var(--app-border);
+    background: var(--app-surface);
+  }
+  @media (min-width: 64em) {
+    .stats { grid-template-columns: repeat(4, 1fr); }
+  }
+  .stat { display: flex; flex-direction: column; gap: var(--app-1); }
+  .stat__label {
+    font-size: var(--app-text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text-muted);
+  }
+  .stat__big {
+    font-size: var(--size-heading);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .nowrap { white-space: nowrap; }
+  .overdue { color: var(--color-warning); }
+  .badge--overdue { color: var(--color-warning); }
+</style>

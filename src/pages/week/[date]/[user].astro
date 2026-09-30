@@ -1,0 +1,590 @@
+---
+import App from '../../../layouts/App.astro';
+import { canViewTimesheet } from '../../../lib/auth/session.ts';
+import { db, rows as sqlRows } from '../../../lib/db/index.ts';
+import { getWeek, listUsers, type WeekRow } from '../../../lib/timesheet/week.ts';
+import { projectOptions, taskOptions, tasksByProject } from '../../../lib/timesheet/pickers.ts';
+import {
+  addDays,
+  dayLong,
+  dayMonth,
+  dayShort,
+  formatCell,
+  formatDuration,
+  isWeekend,
+  startOfWeek,
+  todayIso,
+  weekLabel,
+} from '../../../lib/format.ts';
+import { readSettings } from '../../../lib/settings.ts';
+
+const { date, user } = Astro.params;
+const userId = Number(user);
+
+if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date) || !Number.isInteger(userId)) {
+  return new Response('Not found', { status: 404 });
+}
+
+// Members see only their own sheet; admins and managers may open anyone's.
+const viewer = Astro.locals.user!;
+if (!canViewTimesheet(viewer, userId)) {
+  return new Response('You can only view your own timesheet.', { status: 403 });
+}
+
+const database = db();
+const settings = readSettings(database);
+
+// Normalise to the week's first day so /week/2026-08-19/49 and /week/2026-08-17/49 agree.
+const weekStart = startOfWeek(date, settings.weekStartDay);
+if (weekStart !== date) return Astro.redirect(`/week/${weekStart}/${userId}`, 302);
+
+const week = getWeek(database, userId, weekStart);
+const users = listUsers(database);
+const person = database
+  .prepare("SELECT TRIM(first_name || ' ' || last_name) AS name FROM users WHERE id = ?")
+  .get(userId) as { name: string } | undefined;
+
+const today = todayIso();
+const thisWeek = startOfWeek(today, settings.weekStartDay);
+const previous = addDays(weekStart, -7);
+const next = addDays(weekStart, 7);
+
+// `?p=<projectId>&t=<taskId>` renders an extra empty row. Done on the server so "Add row"
+// survives a reload and needs no JavaScript — a GET form can't combine two fields into one.
+const projectId = Number(Astro.url.searchParams.get('p'));
+const taskId = Number(Astro.url.searchParams.get('t'));
+const extraRows: WeekRow[] = [];
+if (Number.isInteger(projectId) && projectId > 0 && Number.isInteger(taskId) && taskId > 0) {
+  const already = week.rows.some((r) => r.project_id === projectId && r.task_id === taskId);
+  if (!already) {
+    const meta = database
+      .prepare(
+        `SELECT p.name AS project_name, p.code AS project_code, c.name AS client_name,
+                t.name AS task_name
+           FROM projects p JOIN clients c ON c.id = p.client_id, tasks t
+          WHERE p.id = ? AND t.id = ?`,
+      )
+      .get(projectId, taskId) as
+      | { project_name: string; project_code: string | null; client_name: string; task_name: string }
+      | undefined;
+    if (meta) {
+      extraRows.push({
+        project_id: projectId,
+        task_id: taskId,
+        ...meta,
+        cells: week.dates.map((d) => ({ date: d, seconds: 0, entries: [], locked: false })),
+        total: 0,
+        locked: false,
+        locked_reason: null,
+      });
+    }
+  }
+}
+const gridRows = [...week.rows, ...extraRows];
+
+const pickable = projectOptions(database, userId);
+const pickableTasks = taskOptions(database, userId);
+const taskMapping = tasksByProject(database);
+---
+
+<App title={`Week of ${weekStart}`} current="time">
+  <header class="row row--between mb-4 wrap">
+    <div class="row">
+      <div class="row joined">
+        <a class="btn btn--secondary" href={`/week/${previous}/${userId}`} aria-label="Previous week">‹</a>
+        <a class="btn btn--secondary" href={`/week/${next}/${userId}`} aria-label="Next week">›</a>
+      </div>
+      <h1 class="page-title">
+        {weekLabel(weekStart)}
+      </h1>
+      {weekStart !== thisWeek && <a class="small" href={`/week/${thisWeek}/${userId}`}>Return to this week</a>}
+    </div>
+
+    <div class="row">
+      <div class="row joined">
+        <a class="btn btn--secondary" href={`/day/${week.dates[0]}/${userId}`}>Day</a>
+        <button class="btn" type="button" aria-disabled="true" tabindex="-1">Week</button>
+      </div>
+
+      <form method="get" action="/go" class="row gap-2">
+        <label class="visually-hidden" for="user-switch">Whose timesheet</label>
+        <input type="hidden" name="week" value={weekStart} />
+        <select id="user-switch" class="field w-auto" name="user">
+          {users.map((u) => <option value={u.id} selected={u.id === userId}>{u.name}</option>)}
+        </select>
+        <button class="btn btn--secondary" type="submit">Go</button>
+      </form>
+    </div>
+  </header>
+
+  {person && (
+    <p class="small muted mb-3">
+      Viewing <strong>{person.name}</strong>’s timesheet. Changes save to their sheet.
+    </p>
+  )}
+
+  <!-- The whole grid is one form, so Save works with JavaScript switched off. Row and copy
+       buttons use formaction rather than nested forms, which HTML forbids. -->
+  <form method="POST" action="/_actions/saveWeek" id="week-form">
+    <input type="hidden" name="user_id" value={userId} />
+    <input type="hidden" name="week" value={weekStart} />
+
+    <div class="table-wrap">
+      <table class="table week-grid" data-dates={week.dates.join(",")}>
+        <thead>
+          <tr>
+            <th scope="col" class="col-name">Project / Task</th>
+            <th scope="col" class="col-notes"><span class="visually-hidden">Notes</span></th>
+            {week.dates.map((d) => (
+              <th scope="col" class:list={['col-day', { 'is-today': d === today, 'is-weekend': isWeekend(d) }]}>
+                <a href={`/day/${d}/${userId}`} aria-label={`${dayLong(d)}, ${dayMonth(d)}`}>
+                  <span class="day-name">{dayShort(d)}</span>
+                  <span class="day-date">{dayMonth(d)}</span>
+                </a>
+              </th>
+            ))}
+            <th scope="col" class="col-total num">Total</th>
+            <th scope="col" class="col-del"><span class="visually-hidden">Remove row</span></th>
+          </tr>
+        </thead>
+
+        <tbody>
+          {gridRows.length === 0 && (
+            <tr><td colspan="11" class="muted empty">
+              No time logged this week.
+            </td></tr>
+          )}
+
+          {gridRows.map((row) => {
+            const labelId = `r-${row.project_id}-${row.task_id}`;
+            return (
+              <tr class:list={['week-row', { 'is-locked': row.locked }]} data-row={`${row.project_id}:${row.task_id}`}>
+                <th scope="row" id={labelId} class="col-name">
+                  <a class="entry-project" href={`/day/${weekStart}/${userId}`}>
+                    {row.project_code && <span class="code">[{row.project_code}]</span>}{row.project_name}
+                  </a>
+                  <span class="entry-client">{row.client_name}</span>
+                  <span class="entry-task">{row.task_name}</span>
+                </th>
+
+                <td class="col-notes">
+                  <a
+                    class="btn btn--icon js-notes"
+                    href={`/day/${weekStart}/${userId}#notes-${row.project_id}-${row.task_id}`}
+                    data-notes={`${row.project_id}-${row.task_id}`}
+                    aria-label={`Notes for ${row.project_name}, ${row.task_name}`}
+                    title={row.cells.some((c) => c.entries.some((e) => e.notes))
+                      ? 'View notes'
+                      : 'No notes this week'}
+                  >
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                      <rect x="3" y="3" width="18" height="18" /><line x1="7" y1="8" x2="17" y2="8" /><line x1="7" y1="12" x2="17" y2="12" /><line x1="7" y1="16" x2="13" y2="16" />
+                    </svg>
+                  </a>
+                </td>
+
+                {row.cells.map((cell) => (
+                  <td class:list={['col-day', { 'is-today': cell.date === today, 'is-weekend': isWeekend(cell.date) }]}>
+                    {row.locked ? (
+                      <span
+                        class:list={['locked-hours', { 'is-zero': !cell.seconds }]}
+                        aria-label={`Locked hours on ${dayLong(cell.date)}, ${dayMonth(cell.date)}. ${formatDuration(cell.seconds)} hours`}
+                        aria-describedby={labelId}
+                      >{cell.seconds ? formatDuration(cell.seconds) : '0'}</span>
+                    ) : (
+                      <input
+                        class="field cell-input"
+                        type="text"
+                        autocomplete="off"
+                        name={`c_${cell.date}_${row.project_id}_${row.task_id}`}
+                        value={formatCell(cell.seconds)}
+                        data-original={formatCell(cell.seconds)}
+                        aria-label={`Hours on ${dayLong(cell.date)}, ${dayMonth(cell.date)}`}
+                        aria-describedby={labelId}
+                        title={cell.entries.length > 1 ? `${cell.entries.length} entries — open the day view to see the notes` : undefined}
+                      />
+                    )}
+                    {cell.entries.length > 1 && <span class="compound" aria-hidden="true">•</span>}
+                  </td>
+                ))}
+
+                <td class="col-total num">{formatDuration(row.total)}</td>
+
+                <td class="col-del">
+                  {row.locked ? (
+                    <span class="btn btn--icon" title={row.locked_reason ?? 'Locked'} aria-label={row.locked_reason ?? 'Locked'}>
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <rect x="3" y="11" width="18" height="11" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                      </svg>
+                    </span>
+                  ) : (
+                    <button
+                      class="btn btn--icon js-remove"
+                      type="submit"
+                      formaction="/_actions/deleteRow"
+                      formnovalidate
+                      name="row"
+                      value={`${row.project_id}:${row.task_id}`}
+                      aria-label={`Remove ${row.project_name}, ${row.task_name}`}
+                      data-confirm={`Delete this week’s time for ${row.project_name} — ${row.task_name}?`}
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+                        <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                      </svg>
+                    </button>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+
+        <tfoot>
+          <tr>
+            <td class="col-name">
+              <div class="row gap-2">
+                <a class="btn btn--secondary js-add-row" href="#add-row">+ Add</a>
+                <button class="btn" type="submit" id="save">Save</button>
+              </div>
+            </td>
+            <td class="col-notes"></td>
+            {week.day_totals.map((seconds, i) => (
+              <td class:list={['col-day num', { 'is-today': week.dates[i] === today, 'is-weekend': isWeekend(week.dates[i]!) }]}>
+                {formatDuration(seconds)}
+              </td>
+            ))}
+            <td class="col-total num">{formatDuration(week.total)}</td>
+            <td class="col-del"></td>
+          </tr>
+        </tfoot>
+      </table>
+    </div>
+
+    <div class="row mt-3 wrap">
+      {week.copy_from_last_week.available ? (
+        <>
+          <button class="btn btn--secondary" type="submit" formaction="/_actions/copyFromLastWeek" formnovalidate name="mode" value="projects">
+            Copy from last week (projects only)
+          </button>
+          <button class="btn btn--secondary" type="submit" formaction="/_actions/copyFromLastWeek" formnovalidate name="mode" value="entries">
+            Copy with entries
+          </button>
+          <span class="xs muted">{week.copy_from_last_week.rows} rows in week of {week.copy_from_last_week.source}</span>
+        </>
+      ) : (
+        <span class="xs muted">Nothing to copy from the previous week.</span>
+      )}
+    </div>
+  </form>
+
+  {gridRows.filter((r) => r.cells.some((c) => c.entries.length)).map((row) => (
+    <dialog class="dialog" id={`notes-${row.project_id}-${row.task_id}`}
+            aria-labelledby={`notes-title-${row.project_id}-${row.task_id}`}>
+      <h2 class="dialog__title" id={`notes-title-${row.project_id}-${row.task_id}`}>
+        {row.project_code && <span>[{row.project_code}] </span>}{row.project_name}
+        <span> — {row.task_name}</span>
+      </h2>
+
+      <table class="table notes-table">
+        <thead>
+          <tr>
+            <th scope="col">Day</th>
+            <th scope="col" class="num">Hours</th>
+            <th scope="col">Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          {row.cells.flatMap((cell) =>
+            cell.entries.map((entry) => (
+              <tr class:list={[{ 'is-locked': entry.is_locked }]}>
+                <td class="xs">{dayShort(cell.date)} {dayMonth(cell.date)}</td>
+                <td class="num">{formatDuration(entry.duration_seconds)}</td>
+                <td class="small">
+                  {entry.notes ?? <span class="muted">—</span>}
+                  {!entry.is_locked && (
+                    <a class="xs ml-2" href={`/day/${cell.date}/${userId}?edit=${entry.id}`}>edit</a>
+                  )}
+                </td>
+              </tr>
+            )),
+          )}
+        </tbody>
+      </table>
+
+      <div class="dialog__actions">
+        <button class="btn btn--secondary js-close-notes" type="button">Close</button>
+        <span class="xs muted">
+          A day can hold several entries — the grid shows their sum.
+        </span>
+      </div>
+    </dialog>
+  ))}
+
+  <script type="application/json" id="tasks-by-project" set:html={JSON.stringify(taskMapping)} is:inline></script>
+  <script type="application/json" id="all-tasks" set:html={JSON.stringify(pickableTasks.map((t) => ({ id: t.id, name: t.name })))} is:inline></script>
+
+  <dialog class="dialog dialog--narrow" id="add-row" aria-labelledby="add-row-title">
+    <h2 class="dialog__title" id="add-row-title">Add a row</h2>
+    <form method="get" action={`/week/${weekStart}/${userId}`} class="stack" id="add-row-form">
+      <div>
+        <label class="small" for="add-project">Project</label>
+        <select class="field" id="add-project" name="p" required>
+          {pickable.map((p) => (
+            <option value={p.id} data-label={p.label} data-client={p.client_name}>
+              {p.label} — {p.client_name}{p.is_active ? '' : ' (archived)'}
+            </option>
+          ))}
+        </select>
+      </div>
+      <div>
+        <label class="small" for="add-task">Task</label>
+        <select class="field" id="add-task" name="t" required>
+          {pickableTasks.map((t) => <option value={t.id} data-label={t.name}>{t.name}</option>)}
+        </select>
+      </div>
+      <div class="row">
+        <button class="btn" type="submit">Add row</button>
+        <button class="btn btn--secondary js-close" type="button">Cancel</button>
+      </div>
+      <p class="xs muted">The row appears in the grid. It is saved when you press Save.</p>
+    </form>
+  </dialog>
+</App>
+
+<style>
+  .week-grid th,
+  .week-grid td { padding: var(--app-1) var(--app-2); }
+
+  .col-name { min-width: 15rem; font-weight: var(--font-weight-normal); line-height: 1.35; }
+  .col-notes { width: 2rem; }
+  .col-day { width: 4.75rem; text-align: center; position: relative; }
+  .col-total { width: 4.5rem; font-weight: var(--font-weight-medium); }
+  .col-del { width: 2rem; }
+
+  thead .col-day a { display: flex; flex-direction: column; text-decoration: none; line-height: 1.25; }
+  thead .col-day a:hover { text-decoration-line: underline; }
+  .day-name { font-weight: var(--font-weight-medium); color: var(--color-text); }
+  .day-date { font-size: var(--app-text-xs); color: var(--color-text-muted); }
+
+  .entry-project { display: block; font-weight: var(--font-weight-medium); text-decoration: none; }
+  .entry-project:hover { text-decoration-line: underline; }
+  .entry-project .code { color: var(--color-text-muted); margin-right: 0.25em; }
+  /* Five projects share the name "Löpande arbete" — the client line is the only
+     disambiguator, not decoration. */
+  .entry-client,
+  .entry-task { display: block; font-size: var(--app-text-xs); color: var(--color-text-muted); }
+
+  /* Quiet, but never invisible. A cell you can type into has to look like one at rest, and
+     with no shadows in the system that has to come from a fill. */
+  .cell-input {
+    text-align: center;
+    padding: var(--app-1);
+    border-color: transparent;
+    background: color-mix(in srgb, var(--color-ink) 4%, transparent);
+    font-variant-numeric: tabular-nums;
+  }
+  .cell-input:hover { background: color-mix(in srgb, var(--color-ink) 8%, transparent); }
+  .cell-input:focus { background: var(--color-white); }
+
+  .locked-hours { display: inline-block; padding: var(--app-1); font-variant-numeric: tabular-nums; }
+
+  /* Marks a cell holding more than one entry — its notes live in the day view. */
+  .compound { position: absolute; top: 2px; right: 4px; font-size: 10px; line-height: 1; color: var(--color-green-afternoon); }
+
+  .week-row:hover:not(.is-locked) { background: var(--app-surface-sunken); }
+  .notes-table { margin-bottom: var(--app-3); }
+  .notes-table td, .notes-table th { padding: var(--app-1) var(--app-2); }
+
+  .week-row.is-new { background: color-mix(in srgb, var(--color-green-dawn) 35%, transparent); }
+
+  /* Dialogs match the entry editor on the day view, so "a popup" means one thing here. */
+</style>
+
+<script>
+  const form = document.getElementById('week-form') as HTMLFormElement | null;
+  const save = document.getElementById('save') as HTMLButtonElement | null;
+  const table = document.querySelector<HTMLTableElement>('.week-grid');
+  const dates = (table?.dataset.dates ?? '').split(',').filter(Boolean);
+
+  const cells = () => [...document.querySelectorAll<HTMLInputElement>('.cell-input')];
+  const dirty = () =>
+    cells().some((c) => c.value.trim() !== (c.dataset.original ?? '')) ||
+    document.querySelector('.week-row.is-new') !== null;
+
+  function sync() {
+    if (save) save.disabled = !dirty();
+  }
+  sync();
+
+  form?.addEventListener('input', sync);
+
+  // Enter commits the week rather than inserting a newline, matching the entry editor.
+  form?.addEventListener('keydown', (event) => {
+    const target = event.target as HTMLElement;
+    if (event.key === 'Enter' && target.classList.contains('cell-input')) {
+      event.preventDefault();
+      if (dirty()) form.requestSubmit(save ?? undefined);
+    }
+  });
+
+  // ── Add row ───────────────────────────────────────────────────────────────
+  // The dialog's form is a plain GET the server already handles, so without JavaScript this
+  // still works — it just costs a page load. Here we insert the row directly.
+  const dialog = document.getElementById('add-row') as HTMLDialogElement | null;
+  const addForm = document.getElementById('add-row-form') as HTMLFormElement | null;
+
+  for (const trigger of document.querySelectorAll<HTMLAnchorElement>('.js-add-row')) {
+    trigger.addEventListener('click', (event) => {
+      if (!dialog) return;
+      event.preventDefault();
+      dialog.showModal();
+      dialog.querySelector<HTMLSelectElement>('select')?.focus();
+    });
+  }
+
+  for (const close of document.querySelectorAll<HTMLButtonElement>('.js-close')) {
+    close.addEventListener('click', () => dialog?.close());
+  }
+
+  // Tasks follow the selected project. Options are rebuilt rather than hidden — a disabled
+  // <option> still renders in some browsers, and an unpickable choice is just noise.
+  const taskMap: Record<string, number[]> = JSON.parse(
+    document.getElementById('tasks-by-project')?.textContent || '{}',
+  );
+  const allTasks: { id: number; name: string }[] = JSON.parse(
+    document.getElementById('all-tasks')?.textContent || '[]',
+  );
+
+  function bindTaskFilter(project: HTMLSelectElement, task: HTMLSelectElement) {
+    const apply = () => {
+      const allowed = taskMap[project.value];
+      // A project with no assignments at all offers everything rather than nothing.
+      const list = allowed && allowed.length ? allTasks.filter((t) => allowed.includes(t.id)) : allTasks;
+      const wanted = task.value;
+
+      task.replaceChildren();
+      for (const item of list) {
+        const option = document.createElement('option');
+        option.value = String(item.id);
+        option.textContent = item.name;
+        task.append(option);
+      }
+      if (list.some((t) => String(t.id) === wanted)) task.value = wanted;
+      task.disabled = list.length === 0;
+    };
+    project.addEventListener('change', apply);
+    apply();
+  }
+
+  {
+    const project = addForm?.querySelector<HTMLSelectElement>('[name="p"]');
+    const task = addForm?.querySelector<HTMLSelectElement>('[name="t"]');
+    if (project && task) bindTaskFilter(project, task);
+  }
+
+  addForm?.addEventListener('submit', (event) => {
+    if (!table || dates.length !== 7) return; // fall through to the server
+    const projectSelect = addForm.querySelector<HTMLSelectElement>('[name="p"]');
+    const taskSelect = addForm.querySelector<HTMLSelectElement>('[name="t"]');
+    if (!projectSelect || !taskSelect) return;
+
+    const projectId = projectSelect.value;
+    const taskId = taskSelect.value;
+
+    const existing = table.querySelector(`tr[data-row="${projectId}:${taskId}"]`);
+    if (existing) {
+      event.preventDefault();
+      dialog?.close();
+      existing.querySelector<HTMLInputElement>('.cell-input')?.focus();
+      return;
+    }
+
+    event.preventDefault();
+    const projectOption = projectSelect.selectedOptions[0];
+    const taskOption = taskSelect.selectedOptions[0];
+
+    const row = document.createElement('tr');
+    row.className = 'week-row is-new';
+    row.dataset.row = `${projectId}:${taskId}`;
+    const labelId = `r-${projectId}-${taskId}`;
+
+    const header = document.createElement('th');
+    header.scope = 'row';
+    header.id = labelId;
+    header.className = 'col-name';
+    header.innerHTML =
+      `<span class="entry-project"></span><span class="entry-client"></span><span class="entry-task"></span>`;
+    header.querySelector('.entry-project')!.textContent = projectOption?.dataset.label ?? '';
+    header.querySelector('.entry-client')!.textContent = projectOption?.dataset.client ?? '';
+    header.querySelector('.entry-task')!.textContent = taskOption?.dataset.label ?? '';
+    row.append(header);
+
+    const notes = document.createElement('td');
+    notes.className = 'col-notes';
+    row.append(notes);
+
+    for (const date of dates) {
+      const cell = document.createElement('td');
+      cell.className = 'col-day';
+      const input = document.createElement('input');
+      input.className = 'field cell-input';
+      input.type = 'text';
+      input.autocomplete = 'off';
+      input.name = `c_${date}_${projectId}_${taskId}`;
+      input.dataset.original = '';
+      input.setAttribute('aria-describedby', labelId);
+      input.setAttribute('aria-label', `Hours on ${date}`);
+      cell.append(input);
+      row.append(cell);
+    }
+
+    const total = document.createElement('td');
+    total.className = 'col-total num';
+    total.textContent = '0';
+    row.append(total);
+
+    const remove = document.createElement('td');
+    remove.className = 'col-del';
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn btn--icon';
+    button.setAttribute('aria-label', 'Discard this row');
+    button.textContent = '\u00d7';
+    button.addEventListener('click', () => {
+      row.remove();
+      sync();
+    });
+    remove.append(button);
+    row.append(remove);
+
+    table.querySelector('tbody')?.append(row);
+    dialog?.close();
+    row.querySelector<HTMLInputElement>('.cell-input')?.focus();
+    sync();
+  });
+
+  // Notes open in place. Without JavaScript the link falls through to the day view, which
+  // shows the same entries with their notes.
+  for (const trigger of document.querySelectorAll<HTMLAnchorElement>('.js-notes')) {
+    trigger.addEventListener('click', (event) => {
+      const target = document.getElementById(`notes-${trigger.dataset.notes}`) as HTMLDialogElement | null;
+      if (!target) return;
+      event.preventDefault();
+      target.showModal();
+    });
+  }
+  for (const close of document.querySelectorAll<HTMLButtonElement>('.js-close-notes')) {
+    close.addEventListener('click', () => close.closest('dialog')?.close());
+  }
+
+  // Removing a row's time confirms first — it deletes the whole week for that row.
+  for (const button of document.querySelectorAll<HTMLButtonElement>('.js-remove')) {
+    button.addEventListener('click', (event) => {
+      if (!window.confirm(button.dataset.confirm ?? 'Delete this row?')) event.preventDefault();
+    });
+  }
+
+  window.addEventListener('beforeunload', (event) => {
+    if (dirty()) event.preventDefault();
+  });
+</script>

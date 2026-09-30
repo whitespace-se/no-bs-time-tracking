@@ -1,0 +1,485 @@
+---
+import App from '../../layouts/App.astro';
+import { db, fromMinorUnits, row as sqlRow, rows as sqlRows, secondsToHours } from '../../lib/db/index.ts';
+import { formatDuration, formatHours, formatMoney } from '../../lib/format.ts';
+import { readSettings } from '../../lib/settings.ts';
+import { BILL_BY, BUDGET_BY, type BudgetBy } from '../../lib/harvest/constants.ts';
+
+const user = Astro.locals.user!;
+const isAdmin = user.role === 'admin';
+// Rates, fees and cost budgets are the same money the reports and the JSON API keep from
+// members. A project page that shows them anyway would be the one door left open.
+const seesMoney = isAdmin || user.role === 'manager';
+const projectId = Number(Astro.params.id);
+
+if (!Number.isInteger(projectId) || projectId <= 0) {
+  return new Response('Not found', { status: 404 });
+}
+
+const database = db();
+
+const project = sqlRow<{
+  id: number;
+  name: string;
+  code: string | null;
+  notes: string | null;
+  client_name: string;
+  hourly_rate: number | null;
+  is_active: number;
+  is_billable: number;
+  is_fixed_fee: number;
+  bill_by: string | null;
+  fee: number | null;
+  budget_by: string | null;
+  budget_seconds: number | null;
+  budget_amount: number | null;
+  budget_is_monthly: number;
+  cost_budget: number | null;
+  cost_budget_include_expenses: number;
+  notify_when_over_budget: number;
+  over_budget_notification_percentage: number | null;
+  show_budget_to_all: number;
+  starts_on: string | null;
+  ends_on: string | null;
+  currency: string | null;
+  entries: number;
+  seconds: number;
+}>(
+  database
+    .prepare(
+      `SELECT p.id, p.name, p.code, p.notes, c.name AS client_name, p.hourly_rate,
+              p.is_active, p.is_billable, p.is_fixed_fee, p.bill_by, p.fee,
+              p.budget_by, p.budget_seconds, p.budget_amount, p.budget_is_monthly,
+              p.cost_budget, p.cost_budget_include_expenses, p.notify_when_over_budget,
+              p.over_budget_notification_percentage, p.show_budget_to_all,
+              p.starts_on, p.ends_on, p.currency,
+              (SELECT COUNT(*) FROM time_entries WHERE project_id = p.id) AS entries,
+              (SELECT COALESCE(SUM(duration_seconds), 0) FROM time_entries WHERE project_id = p.id) AS seconds
+         FROM projects p JOIN clients c ON c.id = p.client_id WHERE p.id = ?`,
+    )
+    .get(projectId),
+);
+
+if (!project) return new Response('Not found', { status: 404 });
+
+// Except where the project says otherwise — which is exactly what this Harvest flag is for.
+const seesBudget = seesMoney || project.show_budget_to_all === 1;
+
+// Everyone active, with their assignment state — so adding and removing are the same form.
+const people = sqlRows<{
+  id: number;
+  name: string;
+  assigned: number;
+  is_project_manager: number;
+  seconds: number;
+}>(
+  database
+    .prepare(
+      `SELECT u.id, TRIM(u.first_name || ' ' || u.last_name) AS name,
+              COALESCE(ua.is_active, 0) AS assigned,
+              COALESCE(ua.is_project_manager, 0) AS is_project_manager,
+              (SELECT COALESCE(SUM(duration_seconds), 0) FROM time_entries
+                WHERE project_id = ? AND user_id = u.id) AS seconds
+         FROM users u
+    LEFT JOIN user_assignments ua ON ua.project_id = ? AND ua.user_id = u.id
+        WHERE u.is_active = 1
+     ORDER BY assigned DESC, seconds DESC, u.first_name`,
+    )
+    .all(projectId, projectId),
+);
+
+const tasks = sqlRows<{
+  id: number;
+  name: string;
+  assigned: number;
+  billable: number;
+  seconds: number;
+}>(
+  database
+    .prepare(
+      `SELECT t.id, t.name,
+              COALESCE(ta.is_active, 0) AS assigned,
+              COALESCE(ta.billable, t.billable_by_default) AS billable,
+              (SELECT COALESCE(SUM(duration_seconds), 0) FROM time_entries
+                WHERE project_id = ? AND task_id = t.id) AS seconds
+         FROM tasks t
+    LEFT JOIN task_assignments ta ON ta.project_id = ? AND ta.task_id = t.id
+        WHERE t.is_active = 1
+     ORDER BY assigned DESC, seconds DESC, t.name`,
+    )
+    .all(projectId, projectId),
+);
+
+const clients = sqlRows<{ id: number; name: string }>(
+  database.prepare('SELECT id, name FROM clients WHERE is_active = 1 ORDER BY name').all(),
+);
+
+const settings = readSettings(database);
+
+/** Hours on screen, with the account's decimal symbol. */
+const hours = (seconds: number) => formatHours(seconds, settings);
+const currency = project.currency ?? settings.currency;
+const budgetBy = (project.budget_by ?? 'none') as BudgetBy;
+const budgetUnit = (BUDGET_BY[budgetBy] ?? BUDGET_BY.none).unit;
+/** For display. `money()` keeps the raw number, which is what a form field needs. */
+const shown = (minor: number | null) =>
+  minor === null ? '—' : `${formatMoney(minor, settings)} ${currency}`;
+const money = (minor: number | null) => (minor === null ? '' : String(fromMinorUnits(minor)));
+
+// Budget progress only means something when the budget covers the whole project; a per-task or
+// per-person budget is several budgets, and one bar would misrepresent it.
+const budgetTotal = budgetBy === 'project' ? project.budget_seconds : null;
+const budgetUsed = budgetTotal ? Math.min(1, project.seconds / budgetTotal) : null;
+
+const assignedPeople = people.filter((p) => p.assigned).length;
+const assignedTasks = tasks.filter((t) => t.assigned).length;
+---
+
+<App title={project.name} current="projects">
+  <p class="xs muted mb-2">
+    <a href="/projects">Projects</a> / {project.client_name}
+  </p>
+
+  <div class="row row--between mb-4 wrap">
+    <h1 class="page-title">
+      {project.code && <span class="muted">[{project.code}] </span>}{project.name}
+    </h1>
+    <div class="row gap-3">
+      {!project.is_active && <span class="badge badge--locked">Archived</span>}
+      {!project.is_billable && <span class="badge">Non-billable</span>}
+      <span class="xs muted">
+        {project.entries} entries · {formatDuration(project.seconds)}
+        {seesMoney && project.hourly_rate ? ` · ${fromMinorUnits(project.hourly_rate)?.toFixed(2)}/h` : ''}
+      </span>
+    </div>
+  </div>
+
+  {project.notes && <p class="small muted prose-narrow mb-4">{project.notes}</p>}
+
+  <dl class="config mb-4">
+    <div>
+      <dt>Billing</dt>
+      <dd>
+        {project.is_billable ? BILL_BY[(project.bill_by ?? 'none') as keyof typeof BILL_BY] : 'Non-billable'}
+        {project.is_fixed_fee === 1 && <span class="badge ml-2">Fixed fee</span>}
+      </dd>
+    </div>
+    {seesMoney && project.is_fixed_fee === 1 && (
+      <div><dt>Fee</dt><dd>{shown(project.fee)}</dd></div>
+    )}
+    {seesMoney && project.hourly_rate !== null && (
+      <div><dt>Hourly rate</dt><dd>{shown(project.hourly_rate)}</dd></div>
+    )}
+    {seesBudget && (
+    <div>
+      <dt>Budget</dt>
+      <dd>
+        {budgetUnit === null && '—'}
+        {budgetUnit === 'hours' && project.budget_seconds !== null &&
+          `${hours(project.budget_seconds)} h`}
+        {budgetUnit === 'money' && shown(project.budget_amount)}
+        <span class="muted"> {BUDGET_BY[budgetBy].label.toLowerCase()}</span>
+        {project.budget_is_monthly === 1 && <span class="badge ml-2">Resets monthly</span>}
+      </dd>
+    </div>
+    )}
+    {seesBudget && budgetUsed !== null && (
+      <div>
+        <dt>Used</dt>
+        <dd>
+          {hours(project.seconds)} of {hours(budgetTotal!)} h
+          <span class="muted"> ({Math.round((project.seconds / budgetTotal!) * 100)}%)</span>
+          <span class="bar" aria-hidden="true"><span style={`--bar-fill:${budgetUsed * 100}%`}></span></span>
+        </dd>
+      </div>
+    )}
+    {seesMoney && project.cost_budget !== null && (
+      <div><dt>Cost budget</dt><dd>
+        {shown(project.cost_budget)}
+        {project.cost_budget_include_expenses === 1 && <span class="muted"> incl. expenses</span>}
+      </dd></div>
+    )}
+    {(project.starts_on || project.ends_on) && (
+      <div><dt>Dates</dt><dd>{project.starts_on ?? '—'} → {project.ends_on ?? '—'}</dd></div>
+    )}
+    {project.notify_when_over_budget === 1 && (
+      <div><dt>Alert</dt><dd>At {project.over_budget_notification_percentage ?? 100}% of budget</dd></div>
+    )}
+  </dl>
+
+  {isAdmin && (
+    <details class="editor" open={Astro.url.searchParams.has('edit') ? true : undefined}>
+      <summary class="editor__summary">Edit project</summary>
+      {!project.is_active && (
+        <p class="xs muted my-2">
+          Archived. Re-activating releases the entries that archiving locked — entries locked
+          because they were invoiced stay locked.
+        </p>
+      )}
+      <form method="POST" action="/_actions/saveProject" class="stack editor__form">
+        <input type="hidden" name="id" value={project.id} />
+        <div class="editor__grid">
+          <div>
+            <label class="small" for="client_id">Client</label>
+            <select class="field" id="client_id" name="client_id" required>
+              {clients.map((c) => <option value={c.id} selected={c.name === project.client_name}>{c.name}</option>)}
+            </select>
+          </div>
+          <div>
+            <label class="small" for="pname">Name</label>
+            <input class="field" id="pname" name="name" required value={project.name} />
+          </div>
+          <div>
+            <label class="small" for="code">Code</label>
+            <input class="field" id="code" name="code" value={project.code ?? ''} />
+          </div>
+          <div>
+            <label class="small" for="rate">Hourly rate</label>
+            <input class="field" id="rate" name="hourly_rate" inputmode="decimal"
+                   value={project.hourly_rate ? String(fromMinorUnits(project.hourly_rate)) : ''} />
+          </div>
+        </div>
+        <div>
+          <label class="small" for="pnotes">Notes</label>
+          <textarea class="field" id="pnotes" name="notes" rows="2">{project.notes ?? ''}</textarea>
+        </div>
+        <div class="editor__grid">
+          <div>
+            <label class="small" for="bill_by">Bill by</label>
+            <select class="field" id="bill_by" name="bill_by">
+              {Object.entries(BILL_BY).map(([value, label]) => (
+                <option value={value} selected={(project.bill_by ?? 'none') === value}>{label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label class="small" for="fee">Fixed fee</label>
+            <input class="field" id="fee" name="fee" inputmode="decimal" value={money(project.fee)} />
+          </div>
+          <div>
+            <label class="small" for="starts_on">Starts on</label>
+            <input class="field" id="starts_on" name="starts_on" type="date" value={project.starts_on ?? ''} />
+          </div>
+          <div>
+            <label class="small" for="ends_on">Ends on</label>
+            <input class="field" id="ends_on" name="ends_on" type="date" value={project.ends_on ?? ''} />
+          </div>
+        </div>
+
+        <div class="editor__grid">
+          <div>
+            <label class="small" for="budget_by">Budget by</label>
+            <select class="field" id="budget_by" name="budget_by">
+              {Object.entries(BUDGET_BY).map(([value, meta]) => (
+                <option value={value} selected={budgetBy === value}>{meta.label}</option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label class="small" for="budget_hours">Budget (hours)</label>
+            <input class="field" id="budget_hours" name="budget_hours" inputmode="decimal"
+                   value={project.budget_seconds === null ? '' : String(secondsToHours(project.budget_seconds))} />
+          </div>
+          <div>
+            <label class="small" for="budget_money">Budget ({currency})</label>
+            <input class="field" id="budget_money" name="budget_money" inputmode="decimal"
+                   value={money(project.budget_amount)} />
+          </div>
+          <div>
+            <label class="small" for="cost_budget">Cost budget ({currency})</label>
+            <input class="field" id="cost_budget" name="cost_budget" inputmode="decimal"
+                   value={money(project.cost_budget)} />
+          </div>
+        </div>
+        <p class="xs muted">
+          Only the field matching the chosen budget type is kept — an hours budget and a money
+          budget are different things, so the project holds one or the other.
+        </p>
+
+        <div class="row wrap gap-3">
+          <label class="row small gap-2">
+            <input type="checkbox" name="budget_is_monthly" value="true"
+                   checked={Boolean(project.budget_is_monthly)} />
+            Budget resets monthly
+          </label>
+          <label class="row small gap-2">
+            <input type="checkbox" name="cost_budget_include_expenses" value="true"
+                   checked={Boolean(project.cost_budget_include_expenses)} />
+            Cost budget includes expenses
+          </label>
+          <label class="row small gap-2">
+            <input type="checkbox" name="show_budget_to_all" value="true"
+                   checked={Boolean(project.show_budget_to_all)} />
+            Show budget to everyone
+          </label>
+        </div>
+
+        <div class="row wrap gap-3">
+          <label class="row small gap-2">
+            <input type="checkbox" name="notify_when_over_budget" value="true"
+                   checked={Boolean(project.notify_when_over_budget)} />
+            Notify when over budget, at
+          </label>
+          <label class="row small gap-2">
+            <input class="field w-auto" name="over_budget_notification_percentage" inputmode="numeric"
+                   size="4" value={project.over_budget_notification_percentage ?? ''}
+                   aria-label="Over-budget notification percentage" />
+            %
+          </label>
+        </div>
+
+        <div class="row wrap gap-3">
+          <label class="row small gap-2">
+            <input type="checkbox" name="is_billable" value="true" checked={Boolean(project.is_billable)} />
+            Billable
+          </label>
+          <label class="row small gap-2">
+            <input type="checkbox" name="is_fixed_fee" value="true" checked={Boolean(project.is_fixed_fee)} />
+            Fixed fee
+          </label>
+          <label class="row small gap-2">
+            <input type="checkbox" name="is_active" value="true" checked={Boolean(project.is_active)} />
+            Active
+          </label>
+        </div>
+        <div class="row"><button class="btn" type="submit">Save project</button></div>
+      </form>
+    </details>
+  )}
+
+  <div class="assign-grid">
+    <section>
+      <h2 class="assign-head">
+        People <span class="muted small">({assignedPeople} assigned)</span>
+      </h2>
+      <p class="xs muted mb-2">
+        Who may log time to this project.
+      </p>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Name</th>
+              <th scope="col" class="num">Hours</th>
+              <th scope="col">{isAdmin ? 'Assigned' : 'Status'}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {people.map((p) => (
+              <tr class:list={[{ 'is-locked': !p.assigned }]}>
+                <td>
+                  {p.name}
+                  {p.is_project_manager ? <span class="badge ml-2">PM</span> : null}
+                </td>
+                <td class="num">{p.seconds ? formatDuration(p.seconds) : <span class="is-zero">0</span>}</td>
+                <td>
+                  {isAdmin ? (
+                    <form method="POST" action="/_actions/setUserAssignment" class="row gap-2">
+                      <input type="hidden" name="project_id" value={project.id} />
+                      <input type="hidden" name="user_id" value={p.id} />
+                      {p.assigned && <input type="hidden" name="active" value="" />}
+                      {!p.assigned && <input type="hidden" name="active" value="true" />}
+                      <button class="btn btn--quiet small" type="submit">
+                        {p.assigned ? 'Remove' : 'Add'}
+                      </button>
+                    </form>
+                  ) : (
+                    <span class="xs muted">{p.assigned ? 'Assigned' : '—'}</span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <section>
+      <h2 class="assign-head">
+        Tasks <span class="muted small">({assignedTasks} assigned)</span>
+      </h2>
+      <p class="xs muted mb-2">
+        Billability lives here, on the project↔task pair — not on the task itself.
+      </p>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Task</th>
+              <th scope="col" class="num">Hours</th>
+              <th scope="col">{isAdmin ? 'On this project' : 'Status'}</th>
+            </tr>
+          </thead>
+          <tbody>
+            {tasks.map((t) => (
+              <tr class:list={[{ 'is-locked': !t.assigned }]}>
+                <td>{t.name}</td>
+                <td class="num">{t.seconds ? formatDuration(t.seconds) : <span class="is-zero">0</span>}</td>
+                <td>
+                  {isAdmin ? (
+                    <form method="POST" action="/_actions/setTaskAssignment" class="row gap-2">
+                      <input type="hidden" name="project_id" value={project.id} />
+                      <input type="hidden" name="task_id" value={t.id} />
+                      <input type="hidden" name="active" value={t.assigned ? '' : 'true'} />
+                      <label class="xs row gap-1">
+                        <input type="checkbox" name="billable" value="true" checked={Boolean(t.billable)} />
+                        billable
+                      </label>
+                      <button class="btn btn--quiet small" type="submit">
+                        {t.assigned ? 'Remove' : 'Add'}
+                      </button>
+                    </form>
+                  ) : (
+                    <span class="xs muted">
+                      {t.assigned ? (t.billable ? 'Billable' : 'Non-billable') : '—'}
+                    </span>
+                  )}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</App>
+
+<style>
+  .assign-grid {
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: var(--app-5);
+  }
+  @media (min-width: 64em) {
+    .assign-grid { grid-template-columns: 1fr 1fr; }
+  }
+  .assign-head {
+    font-size: var(--size-heading-s);
+    font-weight: var(--font-weight-medium);
+    margin-bottom: var(--app-1);
+  }
+</style>
+
+<style>
+  .config {
+    display: grid;
+    gap: var(--app-2);
+    padding: var(--app-3);
+    border: var(--app-border);
+    background: var(--app-surface);
+  }
+  @media (min-width: 48em) {
+    .config { grid-template-columns: repeat(2, minmax(0, 1fr)); column-gap: var(--app-6); }
+  }
+  .config > div { display: grid; grid-template-columns: 9rem 1fr; gap: var(--app-2); align-items: baseline; }
+  .config dt { font-size: var(--app-text-sm); color: var(--color-text-muted); }
+  .config dd { margin: 0; font-size: var(--app-text-sm); }
+  .bar {
+    display: block;
+    height: 0.375rem;
+    margin-top: var(--app-1);
+    background: var(--app-surface-sunken);
+    border: var(--app-border);
+  }
+  .bar > span { display: block; height: 100%; width: var(--bar-fill, 0%); background: var(--color-green-evening); }
+</style>

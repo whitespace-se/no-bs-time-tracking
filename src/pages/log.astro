@@ -1,0 +1,383 @@
+---
+/**
+ * The log — Harvest's "Detailed time report", entry by entry.
+ *
+ * Harvest groups the rows and puts a subtotal on every group heading, with notes hanging under
+ * their entry rather than squeezed into a column. That shape is what makes a busy month
+ * readable, so it is what this does.
+ */
+import App from '../layouts/App.astro';
+import Pagination from '../components/Pagination.astro';
+import { db, rows as sqlRows } from '../lib/db/index.ts';
+import { paginate, readPageParams } from '../lib/paginate.ts';
+import { readSettings } from '../lib/settings.ts';
+import { addDays, dayShort, formatDuration, formatHours, startOfWeek, todayIso } from '../lib/format.ts';
+import {
+  buildWhere,
+  countEntries,
+  detailRows,
+  filtersToQuery,
+  GROUPS,
+  groupTotals,
+  readFilters,
+  totals,
+  type GroupKey,
+} from '../lib/timesheet/report.ts';
+
+const viewer = Astro.locals.user!;
+const database = db();
+const settings = readSettings(database);
+
+/** Hours on screen, with the account's decimal symbol. */
+const hours = (seconds: number) => formatHours(seconds, settings);
+const privileged = viewer.role === 'admin' || viewer.role === 'manager';
+
+const today = todayIso();
+const filters = readFilters(Astro.url, viewer, {
+  from: startOfWeek(addDays(today, -28), settings.weekStartDay),
+  to: today,
+});
+const where = buildWhere(filters);
+
+const rawGroup = Astro.url.searchParams.get('group') as GroupKey | null;
+// Object.hasOwn, not `in`: `in` walks the prototype chain, so ?group=constructor would pass
+// the guard and put a function into the ORDER BY.
+const group: GroupKey = rawGroup && Object.hasOwn(GROUPS, rawGroup) ? rawGroup : 'date';
+
+const { page: pageNo, perPage } = readPageParams(Astro.url);
+const pageInfo = paginate(countEntries(database, where), pageNo, perPage);
+const entries = detailRows(database, where, GROUPS[group].sort, pageInfo.perPage, pageInfo.offset);
+const sums = totals(database, where);
+const subtotals = groupTotals(database, where, group);
+
+const projectLabel = (e: (typeof entries)[number]) =>
+  e.project_code ? `[${e.project_code}] ${e.project}` : e.project;
+
+const groupKeyOf = (e: (typeof entries)[number]): string => {
+  switch (group) {
+    case 'date': return e.spent_date;
+    case 'client': return e.client;
+    case 'project': return projectLabel(e);
+    case 'task': return e.task;
+    case 'person': return e.person;
+  }
+};
+
+// Filter options. Projects are scoped to the chosen client when there is one, because some
+// thousands of options is not a menu.
+const people = privileged
+  ? sqlRows<{ id: number; name: string }>(
+      database
+        .prepare(
+          `SELECT id, TRIM(first_name || ' ' || last_name) AS name FROM users
+            WHERE is_active = 1 ORDER BY first_name, last_name`,
+        )
+        .all(),
+    )
+  : [];
+
+const clients = sqlRows<{ id: number; name: string }>(
+  database
+    .prepare(
+      `SELECT DISTINCT c.id, c.name FROM clients c
+         JOIN projects p ON p.client_id = c.id
+        WHERE EXISTS (SELECT 1 FROM time_entries te WHERE te.project_id = p.id)
+     ORDER BY c.name`,
+    )
+    .all(),
+);
+
+const projects = sqlRows<{ id: number; label: string }>(
+  database
+    .prepare(
+      `SELECT p.id,
+              CASE WHEN p.code IS NULL THEN p.name ELSE '[' || p.code || '] ' || p.name END AS label
+         FROM projects p
+        WHERE (? IS NULL OR p.client_id = ?)
+          AND EXISTS (SELECT 1 FROM time_entries te WHERE te.project_id = p.id)
+     ORDER BY p.is_active DESC, p.name
+        LIMIT 500`,
+    )
+    .all(filters.clientId, filters.clientId),
+);
+
+const tasks = sqlRows<{ id: number; name: string }>(
+  database
+    .prepare(
+      `SELECT id, name FROM tasks
+        WHERE EXISTS (SELECT 1 FROM time_entries te WHERE te.task_id = tasks.id)
+     ORDER BY name`,
+    )
+    .all(),
+);
+
+const named = (list: { id: number; name?: string; label?: string }[], id: number | null, all: string) =>
+  id === null ? all : (list.find((x) => x.id === id) as { name?: string; label?: string })?.name
+    ?? (list.find((x) => x.id === id) as { label?: string })?.label
+    ?? all;
+
+const groupHref = (key: GroupKey) => `/log?${filtersToQuery(filters, { group: key, page: null })}`;
+const exportHref = `/export/time-entries?${filtersToQuery(filters)}`;
+const pdfHref = `/export/detailed-time.pdf?${filtersToQuery(filters)}`;
+
+// Columns: the group's own value moves into the heading row, so it is not repeated per row.
+const columns = ['date', 'client', 'project', 'task', 'person'].filter((c) => c !== group);
+const span = columns.length + 2;
+---
+
+<App title="Log" current="log">
+  <header class="row row--between mb-3 wrap gap-3">
+    <h1 class="page-title">
+      Log: <span class="regular">{filters.from} – {filters.to}</span>
+    </h1>
+    <div class="row gap-2">
+      <a class="btn btn--secondary" href={`/reports?${filtersToQuery(filters)}`}>Summary report</a>
+      <a class="btn btn--secondary" href={exportHref}>Export {sums.entries} rows</a>
+      <a class="btn" href={pdfHref}>Download PDF</a>
+    </div>
+  </header>
+
+  <details class="panel mb-4" open={Astro.url.search.length > 0}>
+    <summary>Filters</summary>
+    <form method="get" class="filters">
+      <div>
+        <label class="xs muted" for="from">From</label>
+        <input class="field w-auto" id="from" name="from" type="date" value={filters.from} />
+      </div>
+      <div>
+        <label class="xs muted" for="to">To</label>
+        <input class="field w-auto" id="to" name="to" type="date" value={filters.to} />
+      </div>
+
+      {privileged && (
+        <div>
+          <label class="xs muted" for="who">Teammate</label>
+          <select class="field w-auto" id="who" name="user">
+            <option value="">Everyone</option>
+            {people.map((p) => <option value={p.id} selected={p.id === filters.userId}>{p.name}</option>)}
+          </select>
+        </div>
+      )}
+
+      <div>
+        <label class="xs muted" for="client">Client</label>
+        <select class="field w-auto" id="client" name="client">
+          <option value="">All clients</option>
+          {clients.map((c) => <option value={c.id} selected={c.id === filters.clientId}>{c.name}</option>)}
+        </select>
+      </div>
+
+      <div>
+        <label class="xs muted" for="project">Project</label>
+        <select class="field w-auto" id="project" name="project">
+          <option value="">All projects</option>
+          {projects.map((p) => <option value={p.id} selected={p.id === filters.projectId}>{p.label}</option>)}
+        </select>
+      </div>
+
+      <div>
+        <label class="xs muted" for="task">Task</label>
+        <select class="field w-auto" id="task" name="task">
+          <option value="">All tasks</option>
+          {tasks.map((t) => <option value={t.id} selected={t.id === filters.taskId}>{t.name}</option>)}
+        </select>
+      </div>
+
+      <div>
+        <label class="xs muted" for="billable">Billable</label>
+        <select class="field w-auto" id="billable" name="billable">
+          <option value="" selected={filters.billable === null}>Billable and non-billable</option>
+          <option value="yes" selected={filters.billable === true}>Billable</option>
+          <option value="no" selected={filters.billable === false}>Non-billable</option>
+        </select>
+      </div>
+
+      <input type="hidden" name="group" value={group} />
+      <button class="btn" type="submit">Update report</button>
+      <a class="btn btn--quiet" href="/log">Reset</a>
+    </form>
+  </details>
+
+  <div class="summary mb-4">
+    <div>
+      <span class="stat__label">Total hours</span>
+      <span class="stat__big">{hours(sums.seconds)}</span>
+      <p class="small muted mt-1">
+        {hours(sums.uninvoiced)} uninvoiced billable hours · {sums.entries} entries
+        · {hours(sums.rounded)} rounded
+      </p>
+    </div>
+    <dl class="chosen">
+      <div><dt>Teammate</dt><dd>{filters.userId === null ? 'Everyone' : named(people, filters.userId, 'Everyone')}</dd></div>
+      <div><dt>Clients</dt><dd>{named(clients, filters.clientId, 'All clients')}</dd></div>
+      <div><dt>Projects</dt><dd>{named(projects, filters.projectId, 'All projects')}</dd></div>
+      <div><dt>Tasks</dt><dd>{named(tasks, filters.taskId, 'All tasks')}</dd></div>
+      <div>
+        <dt>Billable</dt>
+        <dd>{filters.billable === null ? 'Billable and non-billable' : filters.billable ? 'Billable' : 'Non-billable'}</dd>
+      </div>
+    </dl>
+  </div>
+
+  <nav class="row gap-2 mb-3 wrap small" aria-label="Group by">
+    <span class="muted">Group by:</span>
+    {Object.entries(GROUPS).map(([key, g]) => (
+      <a class="chip" aria-current={key === group ? 'true' : undefined} href={groupHref(key as GroupKey)}>
+        {g.label}
+      </a>
+    ))}
+  </nav>
+
+  <div class="table-wrap">
+    <table class="table log table--banded table--dense">
+      <thead>
+        <tr>
+          {columns.includes('date') && <th scope="col">Date</th>}
+          {columns.includes('client') && <th scope="col">Client</th>}
+          {columns.includes('project') && <th scope="col">Project</th>}
+          {columns.includes('task') && <th scope="col">Task</th>}
+          {columns.includes('person') && <th scope="col">Person</th>}
+          <th scope="col" class="num">Hours <span class="unit">h</span></th>
+          <th scope="col"><span class="visually-hidden">Status</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {entries.length === 0 && (
+          <tr><td colspan={span} class="muted empty">No entries match these filters.</td></tr>
+        )}
+        {entries.map((e, i) => {
+          const key = groupKeyOf(e);
+          const heading = i === 0 || groupKeyOf(entries[i - 1]) !== key;
+          return (
+            <>
+              {heading && (
+                <tr class="group">
+                  <th colspan={span - 2} scope="colgroup">
+                    {group === 'date'
+                      ? <><a href={`/day/${e.spent_date}/${e.user_id}`}>{e.spent_date}</a>
+                          <span class="muted"> {dayShort(e.spent_date)}</span></>
+                      : key}
+                  </th>
+                  <th class="num">{hours(subtotals.get(key) ?? 0)}</th>
+                  <th></th>
+                </tr>
+              )}
+              <tr class:list={[{ 'is-locked': e.is_locked }]}>
+                {columns.includes('date') && (
+                  <td class="xs nowrap">
+                    <a href={`/day/${e.spent_date}/${e.user_id}`}>{e.spent_date}</a>
+                  </td>
+                )}
+                {columns.includes('client') && <td class="small">{e.client}</td>}
+                {columns.includes('project') && (
+                  <td class="small">
+                    <a href={`/projects/${e.project_id}`}>{projectLabel(e)}</a>
+                  </td>
+                )}
+                {columns.includes('task') && <td class="small">{e.task}</td>}
+                {columns.includes('person') && <td class="small">{e.person}</td>}
+                <td class="num">
+                  <a href={`/day/${e.spent_date}/${e.user_id}?edit=${e.id}`}
+                     title={`${formatDuration(e.duration_seconds)} · rounds to ${hours(e.rounded_seconds)}`}>
+                    {hours(e.duration_seconds)}
+                  </a>
+                </td>
+                <td class="xs nowrap">
+                  {e.is_locked === 1 && (
+                    <span class="badge badge--locked" title={e.locked_reason ?? 'Locked'}>locked</span>
+                  )}
+                  {e.is_locked !== 1 && e.billable === 1 && (
+                    <span class="badge badge--billable" title="Billable">billable</span>
+                  )}
+                </td>
+              </tr>
+              {e.notes && (
+                <tr class="notes-row">
+                  <td colspan={span} class="small muted">{e.notes}</td>
+                </tr>
+              )}
+            </>
+          );
+        })}
+      </tbody>
+      <tfoot>
+        <tr>
+          <td colspan={span - 2} class="num"><strong>Total</strong></td>
+          <td class="num"><strong>{hours(sums.seconds)}</strong></td>
+          <td></td>
+        </tr>
+      </tfoot>
+    </table>
+  </div>
+
+  <Pagination page={pageInfo} url={Astro.url} label="entries" />
+</App>
+
+<style>
+  .regular { font-weight: var(--font-weight-regular); }
+
+  .panel {
+    border: var(--app-border);
+    background: var(--app-surface);
+  }
+  .panel > summary {
+    padding: var(--app-2) var(--app-3);
+    cursor: pointer;
+    font-size: var(--app-text-sm);
+  }
+  .filters {
+    display: flex;
+    align-items: flex-end;
+    gap: var(--app-3);
+    flex-wrap: wrap;
+    padding: var(--app-3);
+    border-top: var(--app-border);
+  }
+
+  .summary {
+    display: grid;
+    gap: var(--app-4);
+    padding: var(--app-4);
+    border: var(--app-border);
+    background: var(--app-surface);
+  }
+  @media (min-width: 48em) {
+    .summary { grid-template-columns: 1fr 1fr; }
+  }
+  .stat__label {
+    display: block;
+    font-size: var(--app-text-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--color-text-muted);
+  }
+  .stat__big {
+    font-size: var(--size-heading);
+    font-weight: var(--font-weight-medium);
+    line-height: 1.1;
+    font-variant-numeric: tabular-nums;
+  }
+  .chosen { display: grid; gap: var(--app-1); align-content: start; }
+  .chosen > div { display: grid; grid-template-columns: 8rem 1fr; gap: var(--app-2); }
+  .chosen dt { font-size: var(--app-text-sm); color: var(--color-text-muted); }
+  .chosen dd { margin: 0; font-size: var(--app-text-sm); font-weight: var(--font-weight-medium); }
+
+  .chip {
+    padding: 2px var(--app-2);
+    border: var(--app-border);
+    text-decoration: none;
+  }
+  .chip[aria-current='true'] {
+    background: var(--color-ink);
+    color: var(--app-surface);
+    border-color: var(--color-ink);
+  }
+
+  .log .group th {
+    background: var(--app-surface-sunken);
+    border-top: var(--app-border);
+    font-weight: var(--font-weight-medium);
+  }
+  .log .notes-row td { border-top: 0; padding-top: 0; }
+  .nowrap { white-space: nowrap; }
+</style>

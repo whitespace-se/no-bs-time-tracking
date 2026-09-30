@@ -1,0 +1,30 @@
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    environment:
+      PORT: 4321
+      INSTANCE_DIR: /data
+      SECRET_KEY: ${SECRET_KEY:-}
+      # Required once there is a reverse proxy in front: without it every form post,
+      # the login form included, is refused as cross-site. See .env.example.
+      APP_URL: ${NBST_URL:-}
+    ports:
+      - "${NBST_PORT:-4321}:4321"
+    volumes:
+      # A named volume by default. NBST_DATA=./some/dir bind-mounts a host directory instead,
+      # which must be writable by uid 1000, the user the container runs as.
+      - "${NBST_DATA:-nbst-data}:/data"
+    tmpfs:
+      - /tmp
+    healthcheck:
+      # /login answers without a session and without touching the instance beyond opening it,
+      # which is exactly what "this process is serving" means here.
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4321/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  nbst-data:

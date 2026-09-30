@@ -1,0 +1,178 @@
+---
+/** One estimate: its lines, and the messages Harvest sent about it. Read-only. */
+import App from '../../layouts/App.astro';
+import { db, row as sqlRow, rows as sqlRows } from '../../lib/db/index.ts';
+import { formatMoney } from '../../lib/format.ts';
+import { readSettings } from '../../lib/settings.ts';
+
+const viewer = Astro.locals.user!;
+if (viewer.role === 'member') {
+  return new Response('Administrators and managers only.', { status: 403 });
+}
+
+const estimateId = Number(Astro.params.id);
+if (!Number.isInteger(estimateId) || estimateId <= 0) return new Response('Not found', { status: 404 });
+
+const database = db();
+const settings = readSettings(database);
+const money = (minor: number) => formatMoney(minor, settings);
+
+const estimate = sqlRow<{
+  id: number; number: string; state: string; subject: string | null; purchase_order: string | null;
+  notes: string | null; currency: string; amount: number; tax_rate: number | null; tax_amount: number;
+  tax2_rate: number | null; tax2_amount: number; discount_rate: number | null; discount_amount: number;
+  issue_date: string; sent_at: string | null; accepted_at: string | null; declined_at: string | null;
+  creator_name: string | null; client_id: number; client: string; harvest_id: number | null; updated_at: string;
+}>(
+  database
+    .prepare(`SELECT e.*, c.name AS client FROM estimates e JOIN clients c ON c.id = e.client_id WHERE e.id = ?`)
+    .get(estimateId),
+);
+if (!estimate) return new Response('Not found', { status: 404 });
+
+const lines = sqlRows<{ id: number; kind: string; description: string | null; quantity: number; unit_price: number; amount: number }>(
+  database
+    .prepare('SELECT id, kind, description, quantity, unit_price, amount FROM estimate_line_items WHERE estimate_id = ? ORDER BY position')
+    .all(estimateId),
+);
+const messages = sqlRows<{ id: number; event_type: string | null; sent_by: string | null; recipients_json: string | null; subject: string | null; body: string | null; created_at: string }>(
+  database
+    .prepare('SELECT id, event_type, sent_by, recipients_json, subject, body, created_at FROM estimate_messages WHERE estimate_id = ? ORDER BY created_at, id')
+    .all(estimateId),
+);
+const recipients = (json: string | null): string => {
+  try {
+    const list = JSON.parse(json ?? '[]') as { name?: string; email?: string }[];
+    return list.map((r) => r.name || r.email || '').filter(Boolean).join(', ');
+  } catch {
+    return '';
+  }
+};
+const subtotal = lines.reduce((t, l) => t + l.amount, 0);
+const quantity = (v: number) => (Number.isInteger(v) ? String(v) : String(v).replace('.', settings.decimalSymbol));
+const percent = (rate: number) => `${Number.isInteger(rate) ? rate : String(rate).replace('.', settings.decimalSymbol)} %`;
+const stamp = (iso: string | null) => (iso ? iso.replace('T', ' ').replace('Z', '') : null);
+---
+
+<App title={`Estimate #${estimate.number}`} current="estimates">
+  <p class="xs muted mb-2"><a href="/estimates">Estimates</a> / #{estimate.number}</p>
+  <div class="row row--between mb-2 wrap gap-3">
+    <h1 class="page-title">
+      Estimate #{estimate.number}
+      <span class="state ml-2">
+        {estimate.state === 'accepted' && <span class="badge badge--billable">Accepted</span>}
+        {estimate.state === 'sent' && <span class="badge">Sent</span>}
+        {estimate.state === 'draft' && <span class="badge">Draft</span>}
+        {estimate.state === 'declined' && <span class="badge badge--locked">Declined</span>}
+      </span>
+    </h1>
+    <span class="total">{money(estimate.amount)} {estimate.currency}</span>
+  </div>
+  <p class="small mb-4">
+    <a href={`/clients/${estimate.client_id}`}>{estimate.client}</a>
+    {estimate.subject && <span class="muted"> · {estimate.subject}</span>}
+  </p>
+
+  <div class="cols">
+    <section>
+      <h2 class="section-title">Details</h2>
+      <dl class="config">
+        <div><dt>Issued</dt><dd>{estimate.issue_date}</dd></div>
+        {estimate.purchase_order && <div><dt>PO number</dt><dd>{estimate.purchase_order}</dd></div>}
+        <div><dt>Sent</dt><dd>{stamp(estimate.sent_at) ?? <span class="muted">not sent from Harvest</span>}</dd></div>
+        {estimate.accepted_at && <div><dt>Accepted</dt><dd>{stamp(estimate.accepted_at)}</dd></div>}
+        {estimate.declined_at && <div><dt>Declined</dt><dd>{stamp(estimate.declined_at)}</dd></div>}
+        <div><dt>Created by</dt><dd>{estimate.creator_name ?? <span class="muted">unknown</span>}</dd></div>
+        <div><dt>In Harvest</dt><dd class="muted">{estimate.harvest_id ?? '—'} · updated {stamp(estimate.updated_at)}</dd></div>
+      </dl>
+      {estimate.notes && (
+        <>
+          <h2 class="section-title mt-5">Notes</h2>
+          <p class="notes small">{estimate.notes}</p>
+        </>
+      )}
+    </section>
+
+    <section>
+      <h2 class="section-title">Lines</h2>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Item</th>
+              <th scope="col">Description</th>
+              <th scope="col" class="num">Qty</th>
+              <th scope="col" class="num">Unit price</th>
+              <th scope="col" class="num">Amount</th>
+            </tr>
+          </thead>
+          <tbody>
+            {lines.length === 0 && <tr><td colspan="5" class="muted empty--sm">No lines.</td></tr>}
+            {lines.map((l) => (
+              <tr>
+                <td class="xs nowrap">{l.kind}</td>
+                <td class="small notes">{l.description ?? <span class="muted">—</span>}</td>
+                <td class="num">{quantity(l.quantity)}</td>
+                <td class="num">{money(l.unit_price)}</td>
+                <td class="num">{money(l.amount)}</td>
+              </tr>
+            ))}
+          </tbody>
+          <tfoot>
+            <tr><td colspan="4" class="num muted">Subtotal</td><td class="num">{money(subtotal)}</td></tr>
+            {estimate.discount_amount !== 0 && (
+              <tr><td colspan="4" class="num muted">Discount{estimate.discount_rate !== null && ` (${percent(estimate.discount_rate)})`}</td><td class="num">-{money(estimate.discount_amount)}</td></tr>
+            )}
+            {(estimate.tax_amount !== 0 || estimate.tax_rate !== null) && (
+              <tr><td colspan="4" class="num muted">Tax{estimate.tax_rate !== null && ` (${percent(estimate.tax_rate)})`}</td><td class="num">{money(estimate.tax_amount)}</td></tr>
+            )}
+            {estimate.tax2_amount !== 0 && (
+              <tr><td colspan="4" class="num muted">Tax 2</td><td class="num">{money(estimate.tax2_amount)}</td></tr>
+            )}
+            <tr><td colspan="4" class="num medium">Total</td><td class="num medium">{money(estimate.amount)} {estimate.currency}</td></tr>
+          </tfoot>
+        </table>
+      </div>
+
+      <h2 class="section-title mt-5">Sent from Harvest</h2>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">When</th>
+              <th scope="col">Event</th>
+              <th scope="col">By</th>
+              <th scope="col">To</th>
+              <th scope="col">Subject</th>
+            </tr>
+          </thead>
+          <tbody>
+            {messages.length === 0 && <tr><td colspan="5" class="muted empty--sm">Nothing was sent from Harvest.</td></tr>}
+            {messages.map((m) => (
+              <tr>
+                <td class="xs nowrap">{stamp(m.created_at)}</td>
+                <td class="xs">{m.event_type ?? '—'}</td>
+                <td class="xs">{m.sent_by ?? '—'}</td>
+                <td class="xs">{recipients(m.recipients_json) || <span class="muted">—</span>}</td>
+                <td class="xs muted">{m.subject ?? ''}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+</App>
+
+<style>
+  .cols { display: grid; gap: var(--app-6); align-items: start; }
+  @media (min-width: 64em) { .cols { grid-template-columns: 22rem 1fr; } }
+  .state { vertical-align: middle; font-size: var(--app-text-sm); }
+  .total { font-size: var(--size-heading); font-weight: var(--font-weight-medium); font-variant-numeric: tabular-nums; }
+  .config { display: grid; gap: var(--app-2); margin: 0; }
+  .config > div { display: grid; grid-template-columns: 7rem 1fr; gap: var(--app-2); align-items: baseline; }
+  .config dt { font-size: var(--app-text-sm); color: var(--color-text-muted); }
+  .config dd { margin: 0; font-size: var(--app-text-sm); word-break: break-word; }
+  .notes { white-space: pre-line; }
+  .nowrap { white-space: nowrap; }
+</style>

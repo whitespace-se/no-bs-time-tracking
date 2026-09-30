@@ -1,0 +1,49 @@
+{
+  "name": "no-bs-time-tracking",
+  "version": "0.1.0",
+  "description": "Self-hosted time tracking and migration tools for teams leaving hosted time trackers.",
+  "license": "AGPL-3.0-or-later",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/whitespace-se/no-bs-time-tracking.git"
+  },
+  "bugs": {
+    "url": "https://github.com/whitespace-se/no-bs-time-tracking/issues"
+  },
+  "homepage": "https://github.com/whitespace-se/no-bs-time-tracking#readme",
+  "private": true,
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/node": "^26.3.0",
+    "@types/pdfkit": "^0.17.6",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@astrojs/node": "^11.1.4",
+    "astro": "^7.2.7",
+    "csv-parse": "^7.0.2",
+    "pdfkit": "^0.20.2"
+  },
+  "scripts": {
+    "dev": "INSTANCE_DIR=${INSTANCE_DIR:-instances/default} astro dev",
+    "build": "astro build && node scripts/copy-migrations.ts",
+    "start": "node dist/server/entry.mjs",
+    "preview": "astro preview",
+    "check": "tsc --noEmit",
+    "test": "node --test --experimental-strip-types \"test/**/*.test.ts\"",
+    "test:e2e": "playwright test",
+    "test:smoke": "scripts/smoke.sh local",
+    "test:docker": "scripts/smoke.sh docker",
+    "coverage": "node --test --experimental-strip-types --experimental-test-coverage \"test/**/*.test.ts\"",
+    "import:api": "node --env-file-if-exists=.env scripts/import.ts",
+    "import:dump": "node --env-file-if-exists=.env scripts/import.ts --from-dump",
+    "import:csv": "node --env-file-if-exists=.env scripts/import-csv.ts",
+    "admin": "node scripts/admin.ts"
+  },
+  "type": "module"
+}

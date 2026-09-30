@@ -1,0 +1,122 @@
+---
+import { pageHref, pageNumbers, PER_PAGE_OPTIONS, type Page } from '../lib/paginate.ts';
+
+interface Props {
+  page: Page;
+  url: URL;
+  /** Plural noun for the count line, e.g. "projects". */
+  label: string;
+}
+
+const { page, url, label } = Astro.props;
+const numbers = pageNumbers(page.page, page.pages);
+---
+
+<nav class="pager" aria-label={`${label} pagination`}>
+  <p class="pager__count xs muted" aria-live="polite">
+    {page.total === 0
+      ? `No ${label}`
+      : `${page.from}–${page.to} of ${page.total} ${label}`}
+  </p>
+
+  {page.pages > 1 && (
+    <ul class="pager__list">
+      <li>
+        <a
+          class="pager__step"
+          href={page.hasPrev ? pageHref(url, { page: page.page - 1 }) : undefined}
+          aria-disabled={page.hasPrev ? undefined : 'true'}
+          rel="prev"
+        >‹ Previous</a>
+      </li>
+
+      {numbers.map((n) =>
+        n === null ? (
+          <li class="pager__gap" aria-hidden="true">…</li>
+        ) : (
+          <li>
+            <a
+              class="pager__page"
+              href={pageHref(url, { page: n })}
+              aria-current={n === page.page ? 'page' : undefined}
+              aria-label={`Page ${n}`}
+            >{n}</a>
+          </li>
+        ),
+      )}
+
+      <li>
+        <a
+          class="pager__step"
+          href={page.hasNext ? pageHref(url, { page: page.page + 1 }) : undefined}
+          aria-disabled={page.hasNext ? undefined : 'true'}
+          rel="next"
+        >Next ›</a>
+      </li>
+    </ul>
+  )}
+
+  <form method="get" class="pager__per">
+    {[...url.searchParams.entries()]
+      .filter(([key]) => key !== 'per' && key !== 'page')
+      .map(([key, value]) => <input type="hidden" name={key} value={value} />)}
+    <label class="xs muted" for="per">Per page</label>
+    <select class="field w-auto" id="per" name="per">
+      {PER_PAGE_OPTIONS.map((n) => (
+        <option value={n} selected={n === page.perPage}>{n}</option>
+      ))}
+    </select>
+    <button class="btn btn--quiet small" type="submit">Apply</button>
+  </form>
+</nav>
+
+<style>
+  .pager {
+    display: flex;
+    align-items: center;
+    gap: var(--app-4);
+    flex-wrap: wrap;
+    padding: var(--app-3) 0;
+  }
+  /* Centring the page numbers takes equal-width flanks, not auto margins: three competing
+     `auto`s share the free space three ways, which puts the numbers wherever the count text
+     and the per-page form happen to leave them. Giving both flanks `flex: 1 1 0` makes them
+     the same width whatever they contain, so the middle really is the middle. */
+  .pager__count,
+  .pager__per { flex: 1 1 0; }
+
+  .pager__list {
+    display: flex;
+    align-items: center;
+    gap: var(--app-1);
+    list-style: none;
+  }
+  .pager__page,
+  .pager__step {
+    display: inline-block;
+    padding: var(--app-1) var(--app-2);
+    font-size: var(--app-text);
+    text-decoration: none;
+    border: 1px solid transparent;
+    font-variant-numeric: tabular-nums;
+  }
+  .pager__page:hover,
+  .pager__step:hover { border-color: var(--color-beige-morning); }
+  .pager__page[aria-current='page'] {
+    background: var(--color-ink);
+    color: var(--color-text-on-dark);
+  }
+  /* An anchor with no href is not focusable, which is what a dead arrow should be. */
+  .pager__step[aria-disabled='true'] {
+    color: var(--color-beige-afternoon);
+    cursor: default;
+  }
+  .pager__step[aria-disabled='true']:hover { border-color: transparent; }
+  .pager__gap { color: var(--color-text-muted); padding-inline: var(--app-1); }
+  .pager__per {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: var(--app-2);
+  }
+</style>

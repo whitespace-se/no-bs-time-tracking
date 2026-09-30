@@ -1,0 +1,196 @@
+---
+/**
+ * A running import, whichever kind: CSV files, a Harvest API pull, or Harvest's settings onto a
+ * CSV import. One panel for the setup and Import pages alike, fed by the progress object the
+ * status endpoint serves, and kept current by polling it. With the job done, the page reloads
+ * and renders the outcome.
+ */
+import type { SyncProgress } from '../lib/harvest/sync.ts';
+
+interface Props {
+  sync: SyncProgress;
+}
+
+const { sync } = Astro.props;
+
+const STEPS: Record<SyncProgress['kind'], readonly (readonly [string, string])[]> = {
+  csv: [
+    ['time_report', 'Time report rows'],
+    ['invoice_report', 'Invoice report rows'],
+    ['billing', 'Project billing'],
+  ],
+  'harvest-settings': [
+    ['users', 'People'],
+    ['clients', 'Clients'],
+    ['tasks', 'Tasks'],
+    ['projects', 'Projects'],
+    ['user_assignments', 'Project members'],
+    ['task_assignments', 'Project tasks'],
+  ],
+  'harvest-api': [
+    ['users', 'People'],
+    ['clients', 'Clients'],
+    ['tasks', 'Tasks'],
+    ['projects', 'Projects'],
+    ['user_assignments', 'Project members'],
+    ['task_assignments', 'Project tasks'],
+    ['time_entries', 'Time entries'],
+    ['invoices', 'Invoices'],
+    ['invoice_payments', 'Invoice payments'],
+    ['invoice_messages', 'Invoice messages'],
+    ['contacts', 'Contacts'],
+    ['roles', 'Teams'],
+    ['expenses', 'Expenses'],
+    ['receipts', 'Receipts'],
+    ['estimates', 'Estimates'],
+    ['user_rates', 'Rate histories'],
+  ],
+};
+
+const TITLE: Record<SyncProgress['kind'], string> = {
+  csv: 'Importing CSV files',
+  'harvest-settings': 'Reading project settings from Harvest',
+  'harvest-api': sync.mode === 'full' ? 'Importing from Harvest' : 'Syncing with Harvest',
+};
+
+const steps = STEPS[sync.kind];
+const count = (key: string) => sync.counts[key];
+const total = (key: string) => sync.totals[key];
+
+/** Share done, where the totals are known up front; null draws a bar without an end. */
+function fraction(progress: Pick<SyncProgress, 'counts' | 'totals'>): number | null {
+  const keys = Object.keys(progress.totals);
+  const all = keys.reduce((sum, key) => sum + (progress.totals[key] ?? 0), 0);
+  if (!all) return null;
+  return keys.reduce((sum, key) => sum + Math.min(progress.counts[key] ?? 0, progress.totals[key] ?? 0), 0) / all;
+}
+const share = fraction(sync);
+const phase = (value: string) => value.replace(/_/g, ' ');
+---
+
+<div class="panel import-progress" id="progress" data-phase={sync.phase} aria-live="polite">
+  <p class="small mb-2">
+    <strong>{TITLE[sync.kind]}</strong>{sync.company ? ` · ${sync.company}` : ''}
+  </p>
+
+  <div class="bar" role="progressbar" aria-label="Import progress"
+       aria-valuemin="0" aria-valuemax="100"
+       aria-valuenow={share === null ? undefined : Math.round(share * 100)}
+       data-indeterminate={share === null ? '' : undefined}>
+    <span class="bar__fill" style={share === null ? undefined : `--bar-fill:${(share * 100).toFixed(1)}%`}></span>
+  </div>
+
+  <ul class="entities mt-3">
+    {steps.map(([key, label]) => (
+      <li data-entity={key} aria-current={sync.phase === key ? 'step' : undefined}>
+        <span class="entity__label">{label}</span>
+        <span class="entity__count">
+          <span data-count={key}>{count(key)?.toLocaleString('en') ?? ''}</span>
+          <span class="muted" data-total={key}>{total(key) ? ` of ${total(key)!.toLocaleString('en')}` : ''}</span>
+        </span>
+      </li>
+    ))}
+  </ul>
+
+  <p class="xs muted mt-3">
+    {sync.kind !== 'csv' && <><span data-requests>{sync.requests}</span> requests · </>}
+    <span data-phase-label>{phase(sync.phase)}</span>
+  </p>
+
+  {sync.kind === 'csv' ? (
+    <p class="xs muted mt-2">
+      Everything is written in one transaction, so it all arrives or none of it does. Saving
+      elsewhere in the app waits the few seconds the rows are being written.
+    </p>
+  ) : (
+    <p class="xs muted mt-2">
+      These are records read from Harvest, not rows written here. They are written at the end,
+      in one transaction — so it either all arrives or none of it does.
+      {sync.kind === 'harvest-api' && ' Invoice payments are one request per paid invoice, which is why that phase is the slow one.'}
+    </p>
+  )}
+</div>
+
+<script is:inline>
+  // Poll rather than stream: a dropped EventSource would need reconnect logic to do what a
+  // 1.5 s fetch does for free. The page renders the outcome, so it reloads once there is one.
+  (() => {
+    const panel = document.getElementById('progress');
+    const bar = panel.querySelector('.bar');
+    const fill = panel.querySelector('.bar__fill');
+    const tick = async () => {
+      try {
+        const response = await fetch('/api/import/status', { headers: { Accept: 'application/json' } });
+        const { sync } = await response.json();
+        if (!sync) return;
+        for (const [key, value] of Object.entries(sync.counts)) {
+          const cell = panel.querySelector(`[data-count="${key}"]`);
+          if (cell) cell.textContent = value.toLocaleString('en');
+        }
+        for (const [key, value] of Object.entries(sync.totals)) {
+          const cell = panel.querySelector(`[data-total="${key}"]`);
+          if (cell) cell.textContent = ` of ${value.toLocaleString('en')}`;
+        }
+        for (const item of panel.querySelectorAll('[data-entity]')) {
+          if (item.dataset.entity === sync.phase) item.setAttribute('aria-current', 'step');
+          else item.removeAttribute('aria-current');
+        }
+        const keys = Object.keys(sync.totals);
+        const all = keys.reduce((sum, key) => sum + sync.totals[key], 0);
+        if (all) {
+          const done = keys.reduce((sum, key) => sum + Math.min(sync.counts[key] ?? 0, sync.totals[key]), 0) / all;
+          bar.removeAttribute('data-indeterminate');
+          bar.setAttribute('aria-valuenow', String(Math.round(done * 100)));
+          fill.style.setProperty('--bar-fill', `${(done * 100).toFixed(1)}%`);
+        }
+        const requests = panel.querySelector('[data-requests]');
+        if (requests) requests.textContent = sync.requests;
+        panel.querySelector('[data-phase-label]').textContent = sync.phase.replace(/_/g, ' ');
+        panel.dataset.phase = sync.phase;
+        if (sync.finishedAt) { window.location.reload(); return; }
+      } catch {
+        // A failed poll is not a failed import. Keep asking.
+      }
+      setTimeout(tick, 1000);
+    };
+    setTimeout(tick, 600);
+  })();
+</script>
+
+<style>
+  .import-progress .bar {
+    position: relative;
+    height: 0.4rem;
+    overflow: hidden;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--color-text) 10%, transparent);
+  }
+  .import-progress .bar__fill {
+    position: absolute;
+    inset: 0 auto 0 0;
+    /* How far it has got is data, and arrives as --bar-fill; the bar's own shape is here. */
+    width: var(--bar-fill, 0%);
+    border-radius: inherit;
+    background: var(--color-accent);
+    transition: width 0.4s ease;
+  }
+  /* Nothing to measure against yet: a band sweeps across instead of a width. */
+  .import-progress .bar[data-indeterminate] .bar__fill {
+    width: 35%;
+    --bar-fill: 35%;
+    animation: sweep 1.4s ease-in-out infinite;
+  }
+  @keyframes sweep {
+    from { left: -35%; }
+    to { left: 100%; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .import-progress .bar[data-indeterminate] .bar__fill { animation: none; width: 100%; --bar-fill: 100%; opacity: 0.35; }
+  }
+  .import-progress .entities { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--app-1); }
+  .import-progress .entities li { display: flex; justify-content: space-between; gap: var(--app-3); font-size: var(--app-text-sm); }
+  .import-progress .entities li[aria-current='step'] .entity__label { color: var(--color-text); font-weight: var(--font-weight-medium); }
+  .import-progress .entity__label { color: var(--color-text-soft); }
+  .import-progress .entity__count { font-variant-numeric: tabular-nums; font-weight: var(--font-weight-medium); }
+  .import-progress [data-count]:empty::after { content: '—'; color: var(--color-text-muted); font-weight: 400; }
+</style>

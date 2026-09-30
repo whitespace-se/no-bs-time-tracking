@@ -1,0 +1,257 @@
+---
+import App from '../../layouts/App.astro';
+import { actions } from 'astro:actions';
+import { db, fromMinorUnits, row as sqlRow, rows as sqlRows } from '../../lib/db/index.ts';
+import { formatDuration, formatMoney, startOfWeek, todayIso } from '../../lib/format.ts';
+import { readSettings } from '../../lib/settings.ts';
+
+const viewer = Astro.locals.user!;
+if (viewer.role !== 'admin') return new Response('Administrators only.', { status: 403 });
+
+const saved = Astro.getActionResult(actions.saveUser);
+if (saved && !saved.error) return Astro.redirect(`/team/${saved.data.id}`, 303);
+
+const param = Astro.params.id ?? '';
+const isNew = param === 'new';
+const personId = isNew ? 0 : Number(param);
+if (!isNew && (!Number.isInteger(personId) || personId <= 0)) return new Response('Not found', { status: 404 });
+
+const database = db();
+const settings = readSettings(database);
+
+interface PersonRecord {
+  id: number;
+  email: string;
+  first_name: string;
+  last_name: string;
+  role: 'admin' | 'manager' | 'member';
+  is_active: number;
+  weekly_capacity_seconds: number | null;
+  default_billable_rate: number | null;
+  cost_rate: number | null;
+  has_password: number;
+}
+
+const person = isNew
+  ? null
+  : sqlRow<PersonRecord>(
+      database
+        .prepare(
+          `SELECT id, email, first_name, last_name, role, is_active, weekly_capacity_seconds,
+                  default_billable_rate, cost_rate,
+                  CASE WHEN password_hash IS NULL THEN 0 ELSE 1 END AS has_password
+             FROM users WHERE id = ?`,
+        )
+        .get(personId),
+    );
+if (!isNew && !person) return new Response('Not found', { status: 404 });
+
+const recent = isNew
+  ? []
+  : sqlRows<{ project_name: string; project_code: string | null; client_name: string; seconds: number; last: string }>(
+      database
+        .prepare(
+          `SELECT p.name AS project_name, p.code AS project_code, c.name AS client_name,
+                  SUM(te.duration_seconds) AS seconds, MAX(te.spent_date) AS last
+             FROM time_entries te
+             JOIN projects p ON p.id = te.project_id
+             JOIN clients c ON c.id = p.client_id
+            WHERE te.user_id = ?
+         GROUP BY p.id ORDER BY last DESC LIMIT 15`,
+        )
+        .all(personId),
+    );
+
+const week = startOfWeek(todayIso(), settings.weekStartDay);
+
+// What Harvest knew about this person beyond the form: which teams they were on, how their
+// rates changed over time, and — for a manager — whom they were allowed to see.
+const teams = isNew
+  ? []
+  : sqlRows<{ id: number; name: string }>(
+      database
+        .prepare('SELECT r.id, r.name FROM roles r JOIN role_members m ON m.role_id = r.id WHERE m.user_id = ? ORDER BY r.name')
+        .all(personId),
+    );
+const rateHistory = isNew
+  ? []
+  : sqlRows<{ kind: string; amount: number; start_date: string | null; end_date: string | null }>(
+      database
+        .prepare(
+          `SELECT 'billable' AS kind, amount, start_date, end_date FROM user_billable_rates WHERE user_id = ?
+           UNION ALL
+           SELECT 'cost', amount, start_date, end_date FROM user_cost_rates WHERE user_id = ?
+           ORDER BY kind, start_date`,
+        )
+        .all(personId, personId),
+    );
+const teammates = isNew
+  ? []
+  : sqlRows<{ id: number; name: string }>(
+      database
+        .prepare(
+          `SELECT u.id, TRIM(u.first_name || ' ' || u.last_name) AS name FROM user_teammates t
+             JOIN users u ON u.id = t.user_id WHERE t.manager_user_id = ? ORDER BY u.first_name, u.last_name`,
+        )
+        .all(personId),
+    );
+const fullName = person ? `${person.first_name} ${person.last_name}`.trim() : '';
+---
+
+<App title={isNew ? 'New person' : fullName || 'Person'} current="team">
+  <p class="xs muted mb-2">
+    <a href="/team">Team</a> / {isNew ? 'New' : fullName || person!.email}
+  </p>
+
+  <div class="row row--between mb-4 wrap">
+    <h1 class="page-title">
+      {isNew ? 'New person' : fullName || person!.email}
+    </h1>
+    {!isNew && <a class="small" href={`/week/${week}/${person!.id}`}>Open their timesheet →</a>}
+  </div>
+
+  <div class="detail-grid">
+    <section>
+      <form method="POST" action={actions.saveUser} class="stack">
+        {!isNew && <input type="hidden" name="id" value={person!.id} />}
+        <div class="row gap-3 top">
+          <div class="grow">
+            <label class="small" for="first">First name</label>
+            <input class="field" id="first" name="first_name" value={person?.first_name ?? ''} />
+          </div>
+          <div class="grow">
+            <label class="small" for="last">Last name</label>
+            <input class="field" id="last" name="last_name" value={person?.last_name ?? ''} />
+          </div>
+        </div>
+        <div>
+          <label class="small" for="email">Email</label>
+          <input class="field" id="email" name="email" type="email" required value={person?.email ?? ''} />
+        </div>
+        <div>
+          <label class="small" for="role">Role</label>
+          <select class="field w-md" id="role" name="role">
+            {(['member', 'manager', 'admin'] as const).map((r) => (
+              <option value={r} selected={(person?.role ?? 'member') === r}>{r}</option>
+            ))}
+          </select>
+          <p class="xs muted mt-1">
+            Managers and admins can open anyone’s timesheet. Only admins can change these pages.
+          </p>
+        </div>
+        <div>
+          <label class="small" for="cap">Weekly capacity (hours)</label>
+          <input class="field w-sm" id="cap" name="weekly_capacity_hours" inputmode="decimal"
+                 value={person?.weekly_capacity_seconds ? String(person.weekly_capacity_seconds / 3600) : ''} />
+        </div>
+        <div class="row gap-3 top">
+          <div class="grow">
+            <label class="small" for="brate">Billable rate</label>
+            <input class="field" id="brate" name="default_billable_rate" inputmode="decimal"
+                   value={person?.default_billable_rate ? String(fromMinorUnits(person.default_billable_rate)) : ''} />
+          </div>
+          <div class="grow">
+            <label class="small" for="crate">Cost rate</label>
+            <input class="field" id="crate" name="cost_rate" inputmode="decimal"
+                   value={person?.cost_rate ? String(fromMinorUnits(person.cost_rate)) : ''} />
+          </div>
+        </div>
+        <div>
+          <label class="small" for="pw">{isNew ? 'Password' : 'Set a new password'}</label>
+          <input class="field" id="pw" name="password" type="password" autocomplete="new-password" />
+          <p class="xs muted mt-1">
+            {!isNew && (person!.has_password
+              ? 'Leave blank to keep the current one. Changing it signs them out everywhere.'
+              : 'This account has no password yet, so they cannot sign in.')}
+          </p>
+        </div>
+        <label class="row small gap-2">
+          <input type="checkbox" name="is_active" value="true" checked={person ? Boolean(person.is_active) : true} />
+          Active
+        </label>
+        <div class="row">
+          <button class="btn" type="submit">{isNew ? 'Add person' : 'Save person'}</button>
+          <a class="btn btn--secondary" href="/team">Cancel</a>
+        </div>
+      </form>
+    </section>
+
+    {!isNew && (
+      <section>
+        <h2 class="detail-head">Recent projects</h2>
+        <div class="table-wrap">
+          <table class="table">
+            <thead>
+              <tr>
+                <th scope="col">Project</th>
+                <th scope="col">Client</th>
+                <th scope="col" class="num">Hours</th>
+                <th scope="col">Last</th>
+              </tr>
+            </thead>
+            <tbody>
+              {recent.length === 0 && (
+                <tr><td colspan="4" class="muted empty--sm">
+                  No time logged.
+                </td></tr>
+              )}
+              {recent.map((r) => (
+                <tr>
+                  <td>{r.project_code && <span class="muted">[{r.project_code}] </span>}{r.project_name}</td>
+                  <td class="small muted">{r.client_name}</td>
+                  <td class="num">{formatDuration(r.seconds)}</td>
+                  <td class="xs muted">{r.last}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {(teams.length > 0 || rateHistory.length > 0 || teammates.length > 0) && (
+          <h2 class="detail-head mt-5">From Harvest</h2>
+        )}
+        {teams.length > 0 && (
+          <p class="small mb-3">
+            <span class="muted">Teams: </span>{teams.map((t) => t.name).join(', ')}
+          </p>
+        )}
+        {teammates.length > 0 && (
+          <p class="small mb-3">
+            <span class="muted">May see: </span>
+            {teammates.map((t, i) => <>{i > 0 && ', '}<a href={`/team/${t.id}`}>{t.name}</a></>)}
+          </p>
+        )}
+        {rateHistory.length > 0 && (
+          <div class="table-wrap">
+            <table class="table">
+              <thead>
+                <tr>
+                  <th scope="col" class="num">Rate</th>
+                  <th scope="col" class="num">Amount</th>
+                  <th scope="col">From</th>
+                  <th scope="col">Until</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rateHistory.map((r) => (
+                  <tr>
+                    <td class="xs">{r.kind === 'billable' ? 'Billable' : 'Cost'}</td>
+                    <td class="num">{formatMoney(r.amount, settings)} {settings.currency}</td>
+                    <td class="xs muted">{r.start_date ?? 'the beginning'}</td>
+                    <td class="xs muted">{r.end_date ?? 'now'}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </section>
+    )}
+  </div>
+</App>
+
+<style>
+  .detail-grid { display: grid; grid-template-columns: 1fr; gap: var(--app-5); }
+  @media (min-width: 64em) { .detail-grid { grid-template-columns: 24rem 1fr; } }
+  .detail-head { font-size: var(--size-heading-s); font-weight: var(--font-weight-medium); margin-bottom: var(--app-2); }
+</style>

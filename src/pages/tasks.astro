@@ -1,0 +1,106 @@
+---
+import App from '../layouts/App.astro';
+import { db, fromMinorUnits, rows as sqlRows } from '../lib/db/index.ts';
+import { paginate, readPageParams } from '../lib/paginate.ts';
+import Pagination from '../components/Pagination.astro';
+import { formatDuration } from '../lib/format.ts';
+
+const user = Astro.locals.user!;
+if (user.role !== 'admin') return new Response('Administrators only.', { status: 403 });
+
+const showArchived = Astro.url.searchParams.get('archived') === '1';
+
+interface TaskRow {
+  id: number;
+  name: string;
+  billable_by_default: number;
+  archived_projects: number;
+  default_hourly_rate: number | null;
+  is_active: number;
+  projects: number;
+  seconds: number;
+}
+
+const { page: pageNo, perPage } = readPageParams(Astro.url);
+const total = (db().prepare(`SELECT COUNT(*) n FROM tasks t WHERE (? = 1 OR t.is_active = 1)`).get(showArchived ? 1 : 0) as { n: number }).n;
+const pageInfo = paginate(total, pageNo, perPage);
+
+const tasks = sqlRows<TaskRow>(
+  db()
+    .prepare(
+      `SELECT t.id, t.name, t.billable_by_default, t.default_hourly_rate, t.is_active,
+              COUNT(DISTINCT CASE WHEN ta.is_active = 1 AND p.is_active = 1
+                                  THEN ta.project_id END) AS projects,
+              COUNT(DISTINCT CASE WHEN ta.is_active = 0 OR p.is_active = 0
+                                  THEN ta.project_id END) AS archived_projects,
+              COALESCE((SELECT SUM(duration_seconds) FROM time_entries WHERE task_id = t.id), 0) AS seconds
+         FROM tasks t
+    LEFT JOIN task_assignments ta ON ta.task_id = t.id
+    LEFT JOIN projects p ON p.id = ta.project_id
+        WHERE (? = 1 OR t.is_active = 1)
+     GROUP BY t.id
+     ORDER BY t.is_active DESC, seconds DESC, t.name
+        LIMIT ? OFFSET ?`,
+    )
+    .all(showArchived ? 1 : 0, pageInfo.perPage, pageInfo.offset),
+);
+
+---
+
+<App title="Tasks" current="tasks">
+  <div class="row row--between mb-4">
+    <h1 class="page-title">
+      Tasks <span class="muted small">({pageInfo.total})</span>
+    </h1>
+    <div class="row">
+      <a class="small" href={showArchived ? '/tasks' : '/tasks?archived=1'}>
+        {showArchived ? 'Hide archived' : 'Show archived'}
+      </a>
+      <a class="btn" href="/tasks/new">New task</a>
+    </div>
+  </div>
+
+  <p class="xs muted mb-2">
+    A task’s default only applies where a project doesn’t say otherwise — billability lives on
+    the project↔task assignment.
+  </p>
+
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th scope="col">Task</th>
+          <th scope="col" class="num">Active</th>
+          <th scope="col" class="num">Archived</th>
+          <th scope="col" class="num">Hours</th>
+          <th scope="col">Default</th>
+          <th scope="col">Status</th>
+          <th scope="col"><span class="visually-hidden">Edit</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {tasks.map((t) => (
+          <tr class:list={[{ 'is-locked': !t.is_active }]}>
+            <td class="medium"><a href={`/tasks/${t.id}`}>{t.name}</a></td>
+            <td class="num">{t.projects}</td>
+            <td class="num">
+              {t.archived_projects > 0
+                ? <span class="muted">{t.archived_projects}</span>
+                : <span class="is-zero">0</span>}
+            </td>
+            <td class="num">{formatDuration(t.seconds)}</td>
+            <td class="xs muted">{t.billable_by_default ? 'Billable' : 'Non-billable'}</td>
+            <td>
+              {t.is_active ? <span class="xs muted">Active</span> : <span class="badge badge--locked">Archived</span>}
+            </td>
+            <td class="num"><a class="small" href={`/tasks/${t.id}`}>Edit</a></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <Pagination page={pageInfo} url={Astro.url} label="tasks" />
+
+
+</App>

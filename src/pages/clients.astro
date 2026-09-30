@@ -1,0 +1,100 @@
+---
+import App from '../layouts/App.astro';
+import { db, fromMinorUnits, rows as sqlRows } from '../lib/db/index.ts';
+import { formatDuration } from '../lib/format.ts';
+import { paginate, readPageParams } from '../lib/paginate.ts';
+import Pagination from '../components/Pagination.astro';
+
+const user = Astro.locals.user!;
+const isAdmin = user.role === 'admin';
+const showArchived = Astro.url.searchParams.get('archived') === '1';
+
+interface ClientRow {
+  id: number;
+  name: string;
+  address: string | null;
+  currency: string;
+  is_active: number;
+  projects: number;
+  archived_projects: number;
+  seconds: number;
+}
+
+const { page: pageNo, perPage } = readPageParams(Astro.url);
+const total = (db().prepare(`SELECT COUNT(*) n FROM clients c WHERE (? = 1 OR c.is_active = 1)`).get(showArchived ? 1 : 0) as { n: number }).n;
+const pageInfo = paginate(total, pageNo, perPage);
+
+const clients = sqlRows<ClientRow>(
+  db()
+    .prepare(
+      `SELECT c.id, c.name, c.address, c.currency, c.is_active,
+              COUNT(DISTINCT CASE WHEN p.is_active = 1 THEN p.id END) AS projects,
+              COUNT(DISTINCT CASE WHEN p.is_active = 0 THEN p.id END) AS archived_projects,
+              COALESCE(SUM(te.duration_seconds), 0) AS seconds
+         FROM clients c
+    LEFT JOIN projects p ON p.client_id = c.id
+    LEFT JOIN time_entries te ON te.project_id = p.id
+        WHERE (? = 1 OR c.is_active = 1)
+     GROUP BY c.id
+     ORDER BY c.is_active DESC, c.name
+        LIMIT ? OFFSET ?`,
+    )
+    .all(showArchived ? 1 : 0, pageInfo.perPage, pageInfo.offset),
+);
+
+---
+
+<App title="Clients" current="clients">
+  <div class="row row--between mb-4">
+    <h1 class="page-title">
+      Clients <span class="muted small">({pageInfo.total})</span>
+    </h1>
+    <div class="row">
+      <a class="small" href={showArchived ? '/clients' : '/clients?archived=1'}>
+        {showArchived ? 'Hide archived' : 'Show archived'}
+      </a>
+      {isAdmin && <a class="btn" href="/clients/new">New client</a>}
+    </div>
+  </div>
+
+  <div class="table-wrap">
+    <table class="table">
+      <thead>
+        <tr>
+          <th scope="col">Name</th>
+          <th scope="col">Address</th>
+          <th scope="col" class="num">Active</th>
+          <th scope="col" class="num">Archived</th>
+          <th scope="col" class="num">Hours</th>
+          <th scope="col">Status</th>
+          {isAdmin && <th scope="col"><span class="visually-hidden">Edit</span></th>}
+        </tr>
+      </thead>
+      <tbody>
+        {clients.map((c) => (
+          <tr class:list={[{ 'is-locked': !c.is_active }]}>
+            <td class="medium"><a href={`/clients/${c.id}`}>{c.name}</a></td>
+            <td class="small muted">{c.address ?? '—'}</td>
+            <td class="num">{c.projects}</td>
+            <td class="num">
+              {c.archived_projects > 0
+                ? <span class="muted">{c.archived_projects}</span>
+                : <span class="is-zero">0</span>}
+            </td>
+            <td class="num">{formatDuration(c.seconds)}</td>
+            <td>
+              {c.is_active ? <span class="xs muted">Active</span> : <span class="badge badge--locked">Archived</span>}
+            </td>
+            {isAdmin && (
+              <td class="num"><a class="small" href={`/clients/${c.id}`}>Edit</a></td>
+            )}
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  </div>
+
+  <Pagination page={pageInfo} url={Astro.url} label="clients" />
+
+
+</App>

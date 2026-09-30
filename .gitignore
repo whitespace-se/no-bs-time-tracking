@@ -1,0 +1,26 @@
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Dependencies and build output
+node_modules/
+dist/
+.astro/
+
+# Instance data, databases and Harvest data. Never commit these.
+instances/
+data/
+_data/
+.harvest-dump/
+*.db
+*.db-wal
+*.db-shm
+
+# Playwright output
+test-results/
+playwright-report/
+
+# OS / editor
+.DS_Store
+*.log

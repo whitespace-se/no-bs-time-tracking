@@ -1,0 +1,102 @@
+@import "tailwindcss";
+
+/* Semantic aliases over Tailwind's default theme. Keeping application meaning here makes
+   the UI easy to restyle without coupling templates to a vendor or proprietary brand. */
+
+:root {
+  --color-green-dawn: var(--color-emerald-100);
+  --color-green-morning: var(--color-emerald-200);
+  --color-green-afternoon: var(--color-emerald-500);
+  --color-green-evening: var(--color-emerald-700);
+  --color-green-nightfall: var(--color-emerald-900);
+  --color-purple-dawn: var(--color-violet-100);
+  --color-purple-morning: var(--color-violet-200);
+  --color-purple-afternoon: var(--color-violet-500);
+  --color-purple-evening: var(--color-violet-700);
+  --color-purple-nightfall: var(--color-violet-950);
+  --color-beige-dawn: var(--color-gray-50);
+  --color-beige-morning: var(--color-gray-200);
+  --color-beige-afternoon: var(--color-gray-400);
+  --color-beige-evening: var(--color-gray-600);
+  --color-beige-nightfall: var(--color-gray-950);
+  --color-ink: var(--color-gray-900);
+  --color-brown: var(--color-red-700);
+  --color-cappuccino: var(--color-red-100);
+
+  /* ── Semantic aliases — components use these, never palette names ──
+     The primary action is ink rather than a saturated blue. In a screen that is mostly
+     numbers, a vivid button is the loudest thing on the page and competes with the data;
+     ink recedes and still reads as the one thing to press. Blue stays as the accent, spent
+     only on links, focus and the current page. */
+  --color-text: var(--color-ink);
+  --color-text-soft: var(--color-gray-600);
+  --color-text-muted: var(--color-gray-500);
+  /* A shade below white, so a white card reads as a card without needing an outline or a
+     shadow to say so. */
+  --color-background: color-mix(in srgb, var(--color-ink) 4%, var(--color-white));
+  --color-plate: var(--color-beige-morning);
+  --color-accent: var(--color-blue-600);
+  --color-button: var(--color-gray-900);
+  --color-button-hover: var(--color-gray-800);
+  --color-warning: var(--color-orange-600);
+  --color-positive: var(--color-emerald-600);
+  --color-dark-surface: var(--color-ink);
+  --color-text-on-dark: var(--color-beige-dawn);
+  --color-text-on-dark-soft: color-mix(in srgb, var(--color-beige-dawn) 85%, transparent);
+
+  /* ── Typography ── */
+  --size-display: clamp(2.25rem, 1.24rem + 4.32vw, 4.5rem);
+  --size-heading-lg: clamp(2rem, 1.55rem + 1.92vw, 3.5rem);
+  --size-heading: clamp(1.4375rem, 1.2138rem + 0.936vw, 2.1875rem);
+  --size-heading-prose: clamp(1.125rem, 0.9525rem + 0.72vw, 1.6875rem);
+  --size-heading-s: var(--size-lead);
+  --size-lead: clamp(1.0625rem, 0.98rem + 0.36vw, 1.25rem);
+  --size-body: clamp(1rem, 0.94rem + 0.24vw, 1.125rem);
+  --size-small: 0.9375rem;
+
+  --leading-display: 1.04;
+  --leading-heading: 1.15;
+  --leading-heading-s: 1.3;
+  --leading-lead: 1.5;
+  --leading-body: 1.6;
+
+  --tracking-display: -0.02em;
+  --tracking-heading: -0.01em;
+
+  /* ── Layout ── */
+  --container-max: 82rem;
+  --container-pad: 1.25rem;
+  --content-max: 47.5rem;
+  --content-wide: 51.25rem;
+  --content-prose: 45rem;
+  --prose-max: 56ch;
+
+  --hairline: var(--color-white);
+  --hairline-dark: color-mix(in srgb, var(--color-beige-dawn) 25%, transparent);
+  --cell-pad: 20px;
+  --sect-gap: 20px;
+  --cell-glass: color-mix(in srgb, var(--color-beige-dawn) 70%, transparent);
+
+  --space-2xs: 0.5rem;
+  --space-xs: 0.75rem;
+  --space-s: 1.25rem;
+  --space-m: clamp(1.5rem, 1.28rem + 0.96vw, 2rem);
+  --space-l: clamp(2rem, 1.66rem + 1.44vw, 2.75rem);
+  --space-xl: clamp(3rem, 2.55rem + 1.92vw, 4rem);
+  --space-2xl: clamp(4rem, 3.1rem + 3.84vw, 6rem);
+  --space-section: clamp(5rem, 4.1rem + 3.84vw, 7rem);
+  --space-after-heading: clamp(1.0625rem, 0.92rem + 0.6vw, 1.375rem);
+
+  --focus-ring: 2px solid var(--color-accent);
+
+  --link-thickness: 1px;
+  --link-offset: 4px;
+}
+
+@media (min-width: 48em) {
+  :root {
+    --container-pad: 4rem;
+    --cell-pad: 32px;
+    --sect-gap: 32px;
+  }
+}

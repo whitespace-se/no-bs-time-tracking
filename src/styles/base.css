@@ -1,0 +1,88 @@
+/* Small reset and accessible element defaults. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  /* Native checkboxes, radios and progress bars paint themselves in the browser's own blue
+     unless told otherwise. One line keeps them in the same palette as everything else. */
+  accent-color: var(--color-accent);
+  font-family: var(--font-sans);
+  font-weight: var(--font-weight-normal);
+  font-size: var(--size-body);
+  line-height: var(--leading-body);
+  color: var(--color-text);
+  background: var(--color-background);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4 {
+  font-weight: var(--font-weight-medium);
+  overflow-wrap: break-word;
+}
+
+img,
+svg,
+video,
+canvas {
+  display: block;
+  max-width: 100%;
+}
+
+a {
+  color: inherit;
+  text-decoration-thickness: var(--link-thickness);
+  text-underline-offset: var(--link-offset);
+}
+a:hover {
+  text-decoration-color: var(--color-accent);
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: 0;
+  cursor: pointer;
+}
+
+ul[class],
+ol[class] {
+  list-style: none;
+}
+
+/* One shared high-contrast keyboard focus style. */
+:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.is-dark :focus-visible {
+  outline-color: var(--color-white);
+}
+
+/* Server renders <html class="no-js">; a one-liner in <head> removes it. */
+.no-js .requires-js {
+  display: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,0 +1,361 @@
+---
+/**
+ * Harvest connection and sync history.
+ *
+ * Two kinds of run. A **sync** asks Harvest for everything changed since the last good run
+ * and is cheap enough to do daily while you are still running both systems side by side. A
+ * **full re-import** re-reads the account from the beginning; it is the repair tool, safe to
+ * run at any time because every record is keyed on its Harvest id.
+ */
+import App from '../layouts/App.astro';
+import ImportProgress from '../components/ImportProgress.astro';
+import UploadProgress from '../components/UploadProgress.astro';
+import { db, row as sqlRow, rows as sqlRows } from '../lib/db/index.ts';
+import { formatCount } from '../lib/format.ts';
+import { readSettings } from '../lib/settings.ts';
+import { forgetToken, readCredentials, tokenKeySource } from '../lib/harvest/credentials.ts';
+import { currentSync, isSyncRunning, lastSuccessfulCursor } from '../lib/harvest/sync.ts';
+import type { ImportReport } from '../lib/harvest/import.ts';
+
+const viewer = Astro.locals.user!;
+if (viewer.role !== 'admin') return new Response('Only administrators can see this.', { status: 403 });
+
+const database = db();
+
+// A GET that mutates is wrong, but this one is a deliberate exception scoped to a single
+// destructive-in-the-safe-direction act: forgetting a secret. Erring toward forgetting is
+// the safe failure mode for a token.
+if (Astro.url.searchParams.get('forget') === 'token') {
+  forgetToken(database);
+  return Astro.redirect('/import', 303);
+}
+
+const settings = readSettings(database);
+const stored = readCredentials(database);
+const sync = currentSync();
+const running = isSyncRunning();
+// The outcome of the job that ran last, until the next one starts or the server restarts.
+const finished = sync && sync.finishedAt ? sync : null;
+const cursor = lastSuccessfulCursor(database);
+const error = Astro.url.searchParams.get('error');
+const notice = Astro.url.searchParams.get('notice');
+
+const KIND: Record<string, string> = {
+  'harvest-csv': 'CSV time',
+  'harvest-csv-invoices': 'CSV invoices',
+  'harvest-settings': 'Settings',
+};
+
+// An instance built from CSV exports holds time entries keyed on their content, which the API
+// import does not recognize: a sync or full re-import on top would add every entry a second
+// time. Such an instance gets its missing project settings from Harvest instead.
+const fromCsv = Boolean(sqlRow<{ n: number }>(
+  database.prepare("SELECT 1 AS n FROM time_entries WHERE source_key LIKE 'harvest-csv:%' LIMIT 1").get(),
+));
+
+const runs = sqlRows<{
+  id: number;
+  source: string;
+  started_at: string;
+  finished_at: string | null;
+  status: string;
+  stats_json: string | null;
+  error: string | null;
+}>(
+  database
+    .prepare('SELECT id, source, started_at, finished_at, status, stats_json, error FROM import_runs ORDER BY id DESC LIMIT 20')
+    .all(),
+);
+
+const totals = sqlRow<{ entries: number; hours: number }>(
+  database
+    .prepare('SELECT COUNT(*) AS entries, COALESCE(SUM(duration_seconds), 0) / 3600.0 AS hours FROM time_entries')
+    .get(),
+) ?? { entries: 0, hours: 0 };
+
+const parse = (json: string | null): ImportReport | null => {
+  if (!json) return null;
+  try {
+    const value = JSON.parse(json) as Partial<ImportReport>;
+    // A failed run stores where it stopped instead of a report, so this has to check rather
+    // than cast: reaching for `.reconciliation` on one of those throws while rendering.
+    return value?.reconciliation ? (value as ImportReport) : null;
+  } catch {
+    return null;
+  }
+};
+
+interface FailureDetail {
+  phase: string;
+  pulled: Record<string, number>;
+  requests: number;
+  company: string | null;
+}
+
+/** What a failed run recorded about where it got to. */
+const parseFailure = (json: string | null): FailureDetail | null => {
+  if (!json) return null;
+  try {
+    const value = JSON.parse(json) as { failure?: FailureDetail };
+    return value?.failure ?? null;
+  } catch {
+    return null;
+  }
+};
+
+const elapsed = (from: string, to: string | null) => {
+  const seconds = Math.round((new Date(to ?? from).getTime() - new Date(from).getTime()) / 1000);
+  return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+};
+
+---
+
+<App title="Import" current="import">
+  <div class="row row--between mb-4 wrap gap-3">
+    <h1 class="page-title">Import</h1>
+    <span class="xs muted">
+      {formatCount(totals.entries, settings)} entries · {totals.hours.toFixed(2)} hours in this instance
+    </span>
+  </div>
+
+  {error && <p class="alert mb-4" role="alert">{error}</p>}
+  {notice && <p class="panel mb-4 small" role="status">{notice}</p>}
+
+  {running && sync && <div class="mb-4"><ImportProgress sync={sync} /></div>}
+  {finished?.phase === 'done' && finished.summary && (
+    <p class="panel mb-4 small" role="status">
+      {finished.summary} <span class="muted">Finished {finished.finishedAt!.slice(11, 16)} UTC.</span>
+    </p>
+  )}
+  {finished?.phase === 'failed' && finished.error && (
+    <p class="alert mb-4" role="alert">The last import failed: {finished.error}</p>
+  )}
+
+  <section class="panel mb-4" hidden={running}>
+    <h2 class="section-title">Import an official CSV export</h2>
+    {/* One field per file, as in setup; either may be left empty. */}
+    <form method="POST" action="/api/import/csv" enctype="multipart/form-data" class="stack mt-2" data-upload>
+      <div>
+        <label class="small" for="time_report">Time report <span class="muted">(harvest_time_report.csv)</span></label>
+        <input class="field" id="time_report" name="csv" type="file" accept=".csv,text/csv" />
+      </div>
+      <div>
+        <label class="small" for="invoice_report">Invoice report <span class="muted">(harvest_invoice_report.csv)</span></label>
+        <input class="field" id="invoice_report" name="csv" type="file" accept=".csv,text/csv" />
+      </div>
+      <div class="row"><button class="btn" type="submit">Import CSV</button></div>
+      <UploadProgress />
+    </form>
+    <p class="xs muted mt-2">Choose one file or both. Exact re-imports update rather than duplicate rows. Files over 32 MB can be imported with <span class="mono">npm run import:csv -- time.csv invoices.csv</span>.</p>
+  </section>
+
+  <div class="cols">
+    <section>
+      <h2 class="section-title">Connection</h2>
+      <dl class="config mb-3">
+        <div><dt>Account ID</dt><dd>{stored.accountId ?? <span class="muted">not set</span>}</dd></div>
+        <div><dt>Contact</dt><dd>{stored.contact ?? <span class="muted">not set</span>}</dd></div>
+        <div>
+          <dt>Token</dt>
+          <dd>
+            {stored.accessToken
+              ? <>Stored, encrypted <a class="small ml-2" href="/import?forget=token">Forget it</a></>
+              : <span class="muted">Not stored — paste one for each sync</span>}
+          </dd>
+        </div>
+        <div>
+          <dt>Last good sync</dt>
+          <dd>{cursor ?? <span class="muted">never</span>}</dd>
+        </div>
+      </dl>
+
+      {running ? (
+        <p class="xs muted">An import is running — its progress is at the top of the page.</p>
+      ) : (
+        <form method="POST" action="/api/import/start" class="stack panel">
+          {!stored.accessToken && (
+            <>
+              <div>
+                <label class="small" for="access_token">Personal access token</label>
+                <input class="field" id="access_token" name="access_token" type="password"
+                       required autocomplete="off" />
+              </div>
+              {!stored.accountId && (
+                <div>
+                  <label class="small" for="account_id">Account ID</label>
+                  <input class="field" id="account_id" name="account_id" required autocomplete="off" />
+                </div>
+              )}
+              {!stored.contact && (
+                <div>
+                  <label class="small" for="contact">Contact address</label>
+                  <input class="field" id="contact" name="contact" type="email" required />
+                </div>
+              )}
+              <label class="row small gap-2">
+                <input type="checkbox" name="keep_token" value="true" checked />
+                Remember it for future syncs
+              </label>
+              <p class="xs muted">
+                {tokenKeySource(database) === 'env' ? (
+                  <>
+                    Encrypted with <span class="mono">SECRET_KEY</span>, which is set outside
+                    the database.
+                  </>
+                ) : (
+                  <>
+                    Encrypted with a key stored in this database, so anyone holding a copy of
+                    the file can read the token. Set <span class="mono">SECRET_KEY</span> to
+                    keep the key out of the file.
+                  </>
+                )}
+              </p>
+            </>
+          )}
+
+          {fromCsv ? (
+            <>
+              <div class="row gap-2 wrap">
+                <button class="btn" type="submit" formaction="/api/import/settings">
+                  Get project settings from Harvest
+                </button>
+              </div>
+              <p class="xs muted">
+                This instance was imported from CSV exports, which leave out which projects are
+                fixed fee, their budgets, fees and rates, who is archived, and everyone's email
+                and role. This reads those from Harvest and sets them on the projects, clients,
+                tasks and people already here. Time entries are not changed. A sync or full
+                re-import is not offered here, because on top of a CSV import it would add
+                every time entry a second time.
+              </p>
+            </>
+          ) : (
+            <>
+              <div class="row gap-2 wrap">
+                <button class="btn" type="submit" name="mode" value="incremental">
+                  Sync changes
+                </button>
+                <button class="btn btn--secondary" type="submit" name="mode" value="full">
+                  Full re-import
+                </button>
+              </div>
+              <p class="xs muted">
+                A sync reads everything changed since {cursor ?? 'the beginning'}. A full re-import
+                re-reads the whole account — slower, and the repair for anything that looks wrong.
+              </p>
+            </>
+          )}
+        </form>
+      )}
+    </section>
+
+    <section>
+      <h2 class="section-title">History</h2>
+      <div class="table-wrap">
+        <table class="table">
+          <thead>
+            <tr>
+              <th scope="col">Started</th>
+              <th scope="col">Kind</th>
+              <th scope="col">Took</th>
+              <th scope="col" class="num">Hours</th>
+              <th scope="col">Result</th>
+            </tr>
+          </thead>
+          <tbody>
+            {runs.length === 0 && (
+              <tr><td colspan="5" class="muted empty">No imports yet.</td></tr>
+            )}
+            {runs.map((run) => {
+              const report = parse(run.stats_json);
+              const failure = parseFailure(run.stats_json);
+              return (
+                <>
+                  <tr>
+                    <td class="xs nowrap">{run.started_at.replace('T', ' ').replace('Z', '')}</td>
+                    <td class="xs">{KIND[run.source] ?? (run.source.endsWith('incremental') ? 'Sync' : 'Full')}</td>
+                    <td class="xs muted">{run.finished_at ? elapsed(run.started_at, run.finished_at) : '—'}</td>
+                    <td class="num small">
+                      {report ? report.reconciliation.source_hours.toFixed(2) : '—'}
+                    </td>
+                    <td class="xs">
+                      {run.status === 'ok' && <span class="badge badge--billable">reconciled</span>}
+                      {run.status === 'running' && <span class="badge">running</span>}
+                      {run.status === 'failed' && (
+                        <span class="badge badge--locked">
+                          {report
+                            ? !report.reconciliation.matches
+                              ? `out by ${report.reconciliation.difference.toFixed(2)} h`
+                              : report.invoices && !report.invoices.matches
+                                ? `invoices out by ${report.invoices.difference.toFixed(2)}`
+                                : 'failed'
+                            : 'failed'}
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                  {/* The reason, in the table rather than in a title attribute. A failure you
+                      have to hover to read is a failure nobody reads, and this one costs
+                      minutes of pulling to reproduce. */}
+                  {run.status === 'failed' && (run.error || failure) && (
+                    <tr class="run-detail">
+                      <td colspan="5" class="xs">
+                        {failure && (
+                          <p class="muted mb-1">
+                            Stopped in <strong>{failure.phase.replace(/_/g, ' ')}</strong>
+                            {failure.company ? ` on ${failure.company}` : ''} after {failure.requests} requests
+                            {Object.keys(failure.pulled).length > 0 && (
+                              <> · pulled {Object.entries(failure.pulled)
+                                .map(([entity, n]) => `${formatCount(n, settings)} ${entity.replace(/_/g, ' ')}`)
+                                .join(', ')}</>
+                            )}
+                          </p>
+                        )}
+                        {run.error && <p>{run.error}</p>}
+                      </td>
+                    </tr>
+                  )}
+                </>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+      <p class="xs muted mt-2">
+        “Reconciled” means the hours Harvest reported and the hours stored here agreed to
+        within a hundredth of an hour, and the invoiced amounts agreed exactly. It is the
+        number to check against Harvest's own report.
+      </p>
+    </section>
+  </div>
+</App>
+
+
+<style>
+  .cols { display: grid; gap: var(--app-6); align-items: start; }
+  @media (min-width: 64em) { .cols { grid-template-columns: 22rem 1fr; } }
+
+  .alert {
+    padding: var(--app-2) var(--app-3);
+    border: var(--app-border);
+    border-left: 3px solid var(--color-warning);
+    background: var(--app-surface);
+    font-size: var(--app-text-sm);
+  }
+
+  .panel { padding: var(--app-3); border: var(--app-border); background: var(--app-surface); }
+
+  .config { display: grid; gap: var(--app-2); margin: 0 0 var(--app-3); }
+  .config > div { display: grid; grid-template-columns: 8rem 1fr; gap: var(--app-2); align-items: baseline; }
+  .config dt { font-size: var(--app-text-sm); color: var(--color-text-muted); }
+  .config dd { margin: 0; font-size: var(--app-text-sm); word-break: break-word; }
+
+  .entities { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--app-1); }
+  .entities li { display: flex; justify-content: space-between; gap: var(--app-3); font-size: var(--app-text-sm); }
+  .entity__label { color: var(--color-text-soft); }
+  .entity__count { font-variant-numeric: tabular-nums; font-weight: var(--font-weight-medium); }
+  .entity__count:empty::after { content: '—'; color: var(--color-text-muted); font-weight: 400; }
+
+  .nowrap { white-space: nowrap; }
+  .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.95em; }
+</style>

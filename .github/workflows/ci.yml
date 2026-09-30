@@ -1,0 +1,28 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: node:24
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: npm ci
+      # Build first: the HTTP end-to-end test drives the real built server and skips itself
+      # when dist/ is missing, so building afterwards would quietly leave it unrun.
+      - run: npm run build
+      - run: npm test
+      - run: npm run check
+      - run: npm run test:smoke
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - run: scripts/smoke.sh docker

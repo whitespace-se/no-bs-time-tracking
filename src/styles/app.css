@@ -1,0 +1,824 @@
+/* Dense, responsive application primitives built from the public tokens in tokens.css. */
+
+:root {
+  /* Tighter scale for app surfaces. The marketing --space-* scale stays for page chrome. */
+  --app-1: 0.25rem;
+  --app-2: 0.5rem;
+  --app-3: 0.75rem;
+  --app-4: 1rem;
+  --app-5: 1.5rem;
+  --app-6: 2rem;
+  --app-8: 3rem;
+
+  /* Grid content sits below --size-small (15px); seven columns of numbers need it. */
+  --app-text: 0.875rem;
+  --app-text-sm: 0.8125rem;
+  --app-text-xs: 0.75rem;
+
+  --app-row-h: 2.25rem;
+  --app-control-h: 2.125rem;
+
+  /* Lines are a tint of the text colour rather than a grey of their own, so they sit on any
+     surface without looking painted on. Kept faint: with no shadows they are the only edge a
+     surface has, and a hard line reads as heavier than a soft shadow ever did. */
+  --app-line: color-mix(in srgb, var(--color-ink) 8%, transparent);
+  --app-line-strong: color-mix(in srgb, var(--color-ink) 13%, transparent);
+  --app-border: 1px solid var(--app-line);
+  --app-border-strong: 1px solid var(--app-line-strong);
+
+  --app-surface: var(--color-white);
+  --app-surface-sunken: color-mix(in srgb, var(--color-ink) 3%, var(--color-white));
+  --app-surface-hover: color-mix(in srgb, var(--color-ink) 3.5%, transparent);
+  /* The filled, borderless treatment secondary controls use instead of an outline. */
+  --app-fill: color-mix(in srgb, var(--color-ink) 5%, transparent);
+  --app-fill-hover: color-mix(in srgb, var(--color-ink) 9%, transparent);
+
+  /* One radius family, generous enough that a corner reads as deliberate. */
+  --app-radius-sm: 0.5rem;
+  --app-radius: 0.75rem;
+  --app-radius-lg: 1rem;
+
+  /* Depth comes from tone, not from shadow.
+   *
+   * A page of cards each casting its own shadow reads as clutter, and the shadows fight the
+   * data for attention. Surfaces are separated by fill and a hairline instead, and the one
+   * shadow left is reserved for things that genuinely float above the page — a menu, a
+   * dialog — where the lift is the whole point.
+   */
+  --app-shadow: none;
+  --app-shadow-pop: 0 12px 32px -12px color-mix(in srgb, var(--color-ink) 18%, transparent),
+                    0 1px 2px color-mix(in srgb, var(--color-ink) 6%, transparent);
+
+  --app-ring: 0 0 0 3.5px color-mix(in srgb, var(--color-accent) 18%, transparent);
+  --app-ease: 160ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+/* Figures line up in columns only if the digits share a width, and every screen here is a
+   column of figures. */
+.table,
+.stats,
+.num,
+input[type='text'],
+input[type='number'],
+time {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Layout ──────────────────────────────────────────────────────────────── */
+
+.app-shell {
+  min-height: 100vh;
+  display: flex;
+  flex-direction: column;
+}
+
+.app-container {
+  width: 100%;
+  max-width: var(--container-max);
+  margin-inline: auto;
+  padding-inline: var(--app-4);
+}
+
+/* Sticky, because the nav is how you move between a timesheet and the report you are
+   checking it against, and scrolling back up to change screens is a tax on every comparison. */
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  border-bottom: var(--app-border);
+  background: color-mix(in srgb, var(--app-surface) 85%, transparent);
+  backdrop-filter: saturate(1.8) blur(12px);
+}
+
+@supports not (backdrop-filter: blur(1px)) {
+  .app-header { background: var(--app-surface); }
+}
+
+.app-header__inner {
+  display: flex;
+  align-items: center;
+  gap: var(--app-5);
+  min-height: 3.25rem;
+}
+
+.app-brand {
+  font-weight: var(--font-weight-semibold);
+  font-size: var(--app-text);
+  letter-spacing: -0.011em;
+  text-decoration: none;
+  color: var(--color-text);
+}
+.app-brand:hover { color: var(--color-accent); }
+
+/* The signed-in name, top right: a link to /account rather than a dead label. */
+.app-account {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+  color: var(--color-text-soft);
+  transition: color var(--app-ease);
+}
+.app-account:hover,
+.app-account[aria-current='page'] { color: var(--color-text); }
+
+.app-nav {
+  display: flex;
+  align-items: center;
+  gap: var(--app-4);
+  list-style: none;
+  font-size: var(--app-text);
+  /* Wraps rather than scrolls: a scrolling list clips on both axes, which hides the
+     drop-down panels below it. */
+  flex-wrap: wrap;
+}
+
+.app-nav a {
+  position: relative;
+  text-decoration: none;
+  padding-block: var(--app-2);
+  color: var(--color-text-soft);
+  transition: color var(--app-ease);
+}
+
+.app-nav a:hover {
+  color: var(--color-text);
+}
+
+/* Colour alone would carry the current page; an underline carries it for anyone who cannot
+   see the difference, and reads as a tab bar rather than as a link that happens to be blue. */
+.app-nav a[aria-current='page'] {
+  color: var(--color-text);
+  font-weight: var(--font-weight-medium);
+}
+.app-nav a[aria-current='page']::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: -0.5rem;
+  height: 2px;
+  border-radius: 2px;
+  background: var(--color-accent);
+}
+
+/* Admin drop-down. `details` gives open/close and keyboard access for free; the panel is
+   absolutely positioned so opening it does not push the header around. */
+.app-nav__menu {
+  position: relative;
+}
+
+.app-nav__menu summary {
+  list-style: none;
+  cursor: pointer;
+  color: var(--color-text-soft);
+  /* No vertical padding, unlike the sibling links.
+     `summary` is block-level, so padding-block would make this item taller than the inline
+     links beside it — on which the same padding has no layout effect at all — and the whole
+     header would grow to fit one menu. */
+  padding-block: 0;
+  line-height: inherit;
+}
+
+.app-nav__menu summary::-webkit-details-marker {
+  display: none;
+}
+
+.app-nav__menu summary::after {
+  content: '';
+  display: inline-block;
+  margin-left: var(--app-1);
+  border: 3px solid transparent;
+  border-top-color: currentColor;
+  translate: 0 2px;
+}
+
+.app-nav__menu summary:hover,
+.app-nav__menu summary[aria-current='page'],
+.app-nav__menu details[open] summary {
+  color: var(--color-text);
+}
+.app-nav__menu summary[aria-current='page'] {
+  font-weight: var(--font-weight-medium);
+}
+
+.app-menu {
+  position: absolute;
+  /* Pinned to the bottom of the trigger rather than floated by margins, so the panel does not
+     move when the header's height changes. */
+  top: 100%;
+  right: 0;
+  z-index: 10;
+  min-width: 10rem;
+  margin-top: var(--app-2);
+  padding: var(--app-1);
+  list-style: none;
+  background: var(--app-surface);
+  border: var(--app-border);
+  border-radius: var(--app-radius);
+  box-shadow: var(--app-shadow-pop);
+  overflow: hidden;
+}
+
+.app-menu a {
+  display: block;
+  padding: var(--app-2) var(--app-3);
+  border-radius: var(--app-radius-sm);
+  text-decoration: none;
+  color: var(--color-text-soft);
+}
+
+.app-menu a:hover {
+  background: var(--app-surface-hover);
+  color: var(--color-text);
+  text-decoration-line: none;
+}
+
+.app-main {
+  flex: 1;
+  padding-block: var(--app-5) var(--app-6);
+}
+
+@media (max-width: 60rem) {
+  .app-header__inner { flex-wrap: wrap; gap: var(--app-2) var(--app-4); padding-block: var(--app-2); }
+  .app-header nav { order: 3; width: 100%; }
+  .app-nav { padding-bottom: var(--app-1); }
+}
+
+/* ── Buttons — ported from components/ui/ui.scss, sized down for app use ──── */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--app-2);
+  min-height: var(--app-control-h);
+  padding: 0 var(--app-3);
+  background: var(--color-button);
+  color: var(--color-white);
+  font-size: var(--app-text);
+  font-weight: var(--font-weight-medium);
+  line-height: 1;
+  text-decoration: none;
+  white-space: nowrap;
+  border: 1px solid transparent;
+  border-radius: var(--app-radius-sm);
+  box-shadow: var(--app-shadow);
+  transition: background-color var(--app-ease), color var(--app-ease),
+              border-color var(--app-ease), box-shadow var(--app-ease),
+              translate var(--app-ease);
+}
+.btn:hover:not(:disabled) {
+  background: var(--color-button-hover);
+  color: var(--color-white);
+}
+/* A pressed button moves. It is a hair of feedback that makes a form feel answered even
+   before the page reloads. */
+.btn:active:not(:disabled) {
+  translate: 0 1px;
+  box-shadow: none;
+}
+/* A disabled button still has to read as a button. Dropping the fill without putting a border
+   back leaves the label floating as bare text, which looks like a bug rather than a state. */
+.btn:disabled {
+  background: var(--app-fill);
+  border-color: transparent;
+  color: var(--color-text-muted);
+  box-shadow: none;
+  cursor: not-allowed;
+}
+.btn:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 2px;
+}
+
+.btn--secondary {
+  background: var(--app-fill);
+  color: var(--color-text);
+  border-color: transparent;
+}
+.btn--secondary:hover:not(:disabled) {
+  background: var(--app-fill-hover);
+  color: var(--color-text);
+  border-color: transparent;
+}
+.btn--secondary:disabled {
+  background: var(--app-fill);
+  border-color: transparent;
+  color: var(--color-text-muted);
+}
+
+/* The one destructive treatment, so "this deletes something" looks the same everywhere. */
+.btn--danger {
+  background: color-mix(in srgb, var(--color-brown) 10%, transparent);
+  color: var(--color-brown);
+  border-color: transparent;
+}
+.btn--danger:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-brown) 16%, transparent);
+  color: var(--color-brown);
+  border-color: transparent;
+}
+.btn--secondary:disabled {
+  background: transparent;
+  border-color: var(--color-beige-morning);
+}
+
+.btn--quiet {
+  background: transparent;
+  color: var(--color-text-soft);
+  min-height: auto;
+  padding: var(--app-1) var(--app-2);
+  box-shadow: none;
+}
+.btn--quiet:hover:not(:disabled) {
+  background: var(--app-surface-hover);
+  color: var(--color-text);
+}
+
+.btn--icon {
+  min-height: auto;
+  padding: var(--app-1);
+  background: transparent;
+  color: var(--color-text-muted);
+  box-shadow: none;
+}
+.btn--icon:hover:not(:disabled) {
+  background: var(--app-surface-hover);
+  color: var(--color-text);
+}
+.btn--icon:disabled {
+  background: transparent;
+  color: var(--color-beige-morning);
+}
+
+/* ── Inputs ──────────────────────────────────────────────────────────────── */
+
+.field {
+  font: inherit;
+  font-size: var(--app-text);
+  min-height: var(--app-control-h);
+  padding: var(--app-1) var(--app-2);
+  background: var(--app-fill);
+  border: 1px solid transparent;
+  color: var(--color-text);
+  width: 100%;
+  border-radius: var(--app-radius-sm);
+  transition: border-color var(--app-ease), box-shadow var(--app-ease),
+              background-color var(--app-ease);
+}
+.field:hover:not(:disabled):not(:focus) {
+  background: var(--app-fill-hover);
+}
+/* A ring rather than a thicker border, so focusing a field does not shift the row it is in.
+   The border stays where it was: a ring and a recoloured edge together read as two rings. */
+.field:focus-visible,
+.field:focus {
+  background: var(--app-surface);
+  border-color: color-mix(in srgb, var(--color-accent) 50%, transparent);
+  outline: none;
+  box-shadow: var(--app-ring);
+}
+.field:disabled {
+  background: var(--app-surface-sunken);
+  color: var(--color-text-muted);
+  box-shadow: none;
+}
+.field::placeholder { color: var(--color-text-muted); }
+
+/* The same chevron the disclosure panels use, so "there is more here" looks like one idea
+   across the application. A select cannot carry a pseudo-element, so it is drawn as an SVG. */
+select.field {
+  appearance: none;
+  padding-right: var(--app-6);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none'%3E%3Cpath d='M1.5 1.75 6 6.25l4.5-4.5' stroke='%236b7280' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-position: right var(--app-3) center;
+  background-size: 12px 8px;
+  background-repeat: no-repeat;
+}
+
+/* ── Table ───────────────────────────────────────────────────────────────── */
+
+.table-wrap {
+  overflow-x: auto;
+  background: var(--app-surface);
+  border: var(--app-border);
+  border-radius: var(--app-radius-lg);
+}
+/* The outer radius has to be clipped onto the first and last cells, or the table's square
+   corners poke through the rounded card. */
+.table-wrap > .table > :first-child > tr:first-child > *:first-child { border-top-left-radius: var(--app-radius-lg); }
+.table-wrap > .table > :first-child > tr:first-child > *:last-child { border-top-right-radius: var(--app-radius-lg); }
+.table-wrap > .table > :last-child > tr:last-child > * { border-bottom: 0; }
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--app-text);
+  font-variant-numeric: tabular-nums;
+}
+
+.table th,
+.table td {
+  padding: var(--app-2) var(--app-3);
+  text-align: left;
+  border-bottom: var(--app-border);
+  vertical-align: middle;
+}
+
+/* Hover the row, not the cell: these tables are wide, and following one record across seven
+   columns is the whole job. */
+.table tbody tr {
+  transition: background-color var(--app-ease);
+}
+.table tbody tr:hover {
+  background: var(--app-surface-hover);
+}
+
+/* A failed run's reason, on the row under the run itself. Tinted rather than boxed, so it
+   reads as belonging to the row above rather than as another entry in the list. */
+.run-detail > td {
+  padding-top: 0;
+  background: var(--app-surface-2, rgba(0, 0, 0, 0.03));
+  border-bottom: var(--app-border);
+}
+
+.run-detail p {
+  margin: 0;
+  max-width: 80ch;
+}
+
+/* Figures hug their column and the text column takes what is left, so the numbers sit in a
+   narrow band at the right rather than drifting apart across a wide screen. */
+.table th.num,
+.table td.num {
+  width: 1%;
+}
+
+/* Not sticky: the wrapper scrolls horizontally, and a sticky head inside a scroll container
+   positions against that container rather than the page, which drops it on top of the first
+   rows. Column names staying put is not worth a broken table. */
+.table thead th {
+  font-weight: var(--font-weight-medium);
+  font-size: var(--app-text-xs);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+  background: var(--app-surface-sunken);
+  border-bottom: var(--app-border-strong);
+  white-space: nowrap;
+}
+
+.table tfoot td {
+  font-weight: var(--font-weight-semibold);
+  color: var(--color-text);
+  border-top: var(--app-border-strong);
+  border-bottom: 0;
+  background: var(--app-surface-sunken);
+}
+.table tfoot tr:hover { background: var(--app-surface-sunken); }
+
+.table .num {
+  text-align: right;
+  white-space: nowrap;
+  /* Lining, fixed-width digits: a column of figures is only scannable if every digit sits in
+     the same place on every row, and 0 and 8 are the same width. */
+  font-variant-numeric: tabular-nums lining-nums;
+  font-feature-settings: 'tnum' 1, 'lnum' 1;
+}
+
+/* The figure carries the row; its unit, currency or qualifier should not compete with it. */
+.table .num .unit,
+.table .num small {
+  margin-left: 0.25em;
+  color: var(--color-text-muted);
+  font-size: 0.9em;
+  font-weight: var(--font-weight-regular, 400);
+}
+
+/* Nothing there is not the same as something small. A zero reads as background; a negative
+   number is the one figure in a column that has to be noticed. */
+.table .num.is-zero,
+.table .num .is-zero {
+  color: var(--color-text-muted);
+}
+.table .num.is-negative {
+  color: var(--color-warning);
+}
+
+/* The figure a row is about, where a table carries several: one weight above its neighbours,
+   never a different colour. */
+.table .num.is-lead {
+  font-weight: var(--font-weight-medium);
+  color: var(--color-text);
+}
+
+/* Actions sit right, with the figures, but are not figures: no tabular digits, no width 1%
+   fight with the real numeric columns. */
+.table .actions {
+  text-align: right;
+  white-space: nowrap;
+}
+
+/* Wide tables, where the eye has to carry a row across many columns. */
+.table--banded tbody tr:nth-child(even of :not([hidden])) {
+  background: color-mix(in srgb, var(--color-text) 2.5%, transparent);
+}
+.table--banded tbody tr:hover {
+  background: var(--app-surface-hover);
+}
+
+/* Long lists — the log, the entries under a report — where density is the point. */
+.table--dense th,
+.table--dense td {
+  padding: var(--app-1) var(--app-3);
+}
+
+/* ── State treatments ────────────────────────────────────────────────────── */
+
+.is-locked {
+  background: var(--app-surface-sunken);
+  color: var(--color-text-muted);
+}
+
+.is-today {
+  background: color-mix(in srgb, var(--color-green-dawn) 45%, transparent);
+}
+
+.is-zero {
+  color: var(--color-beige-afternoon);
+}
+
+.is-weekend {
+  background: color-mix(in srgb, var(--color-beige-dawn) 40%, transparent);
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--app-1);
+  padding: 0.0625rem var(--app-2);
+  font-size: var(--app-text-xs);
+  font-weight: var(--font-weight-medium);
+  line-height: 1.5;
+  border: 1px solid transparent;
+  border-radius: var(--radius-full);
+  background: color-mix(in srgb, var(--color-ink) 6%, transparent);
+  color: var(--color-text-soft);
+  white-space: nowrap;
+}
+/* Tinted from the same colour as the text, so a status reads at a glance without becoming
+   the brightest thing in the row. */
+.badge--billable {
+  background: color-mix(in srgb, var(--color-positive) 12%, transparent);
+  color: var(--color-green-evening);
+}
+.badge--locked {
+  background: color-mix(in srgb, var(--color-ink) 6%, transparent);
+  color: var(--color-text-muted);
+}
+.badge--warning {
+  background: color-mix(in srgb, var(--color-warning) 14%, transparent);
+  color: var(--color-warning);
+}
+
+/* ── Utility ─────────────────────────────────────────────────────────────── */
+
+.muted {
+  color: var(--color-text-muted);
+}
+.small {
+  font-size: var(--app-text-sm);
+}
+.xs {
+  font-size: var(--app-text-xs);
+}
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--app-3);
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: var(--app-3);
+}
+.row--between {
+  justify-content: space-between;
+}
+.push {
+  margin-left: auto;
+}
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* ── Edit forms ──────────────────────────────────────────────────────────────
+ * These sit below tables that can run to 200 rows, so an "Edit" link that only
+ * reloads the page looks broken. The link carries #edit-form; :target then makes
+ * it obvious which record you landed on. No JavaScript involved.
+ */
+#edit-form {
+  scroll-margin-top: var(--app-4);
+  border-left: 2px solid transparent;
+  padding-left: var(--app-3);
+  transition: border-color 200ms, background-color 200ms;
+}
+#edit-form:target {
+  border-left-color: var(--color-accent);
+  background: var(--app-surface-sunken);
+  padding-block: var(--app-3);
+}
+
+/* ── Dialogs ─────────────────────────────────────────────────────────────────
+ * One dialog treatment for the whole app, so "a popup" means one thing.
+ *
+ * Centring needs stating explicitly: showModal() centres a dialog, but one rendered with the
+ * `open` attribute — which is how the no-JavaScript path works — sits in normal document
+ * flow instead. Fixed positioning with auto margins centres both cases.
+ */
+dialog.dialog {
+  position: fixed;
+  inset: 0;
+  margin: auto;
+  width: min(34rem, calc(100vw - 2rem));
+  max-height: calc(100vh - 4rem);
+  overflow-y: auto;
+  padding: var(--app-5);
+  border: var(--app-border-strong);
+  background: var(--app-surface);
+  color: var(--color-text);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-xl);
+}
+dialog.dialog--narrow { width: min(28rem, calc(100vw - 2rem)); }
+dialog.dialog::backdrop { background: color-mix(in srgb, var(--color-ink) 45%, transparent); }
+
+/* Server-rendered open dialogs get a backdrop of their own, since ::backdrop only paints
+   for showModal(). */
+dialog.dialog[open]:not(:modal) {
+  box-shadow: 0 0 0 100vmax color-mix(in srgb, var(--color-ink) 45%, transparent);
+}
+
+.dialog__title {
+  font-size: var(--size-heading-s);
+  font-weight: var(--font-weight-medium);
+  margin-bottom: var(--app-4);
+}
+.dialog__title span { color: var(--color-text-muted); }
+
+.dialog__form { display: flex; flex-direction: column; gap: var(--app-3); }
+
+.dialog__actions {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--app-3);
+  flex-wrap: wrap;
+  margin-top: var(--app-2);
+}
+
+.dialog__danger {
+  margin-top: var(--app-3);
+  padding-top: var(--app-3);
+  border-top: var(--app-border);
+  display: flex;
+  justify-content: flex-end;
+}
+.dialog__danger .btn { color: var(--color-brown); }
+
+kbd {
+  font: inherit;
+  font-size: var(--app-text-xs);
+  border: var(--app-border);
+  padding: 0 0.25em;
+  border-radius: var(--radius-sm);
+  background: var(--color-gray-50);
+}
+
+/* ── Utilities ───────────────────────────────────────────────────────────────
+ * These replace inline style attributes. Everything derives from a token; there are no
+ * literal colours, and the only bare lengths are field widths, which have no token.
+ */
+.page-title {
+  font-size: var(--text-2xl);
+  line-height: var(--text-2xl--line-height);
+  font-weight: var(--font-weight-semibold);
+  letter-spacing: -0.018em;
+}
+.section-title {
+  font-size: var(--size-heading-s);
+  font-weight: var(--font-weight-medium);
+  margin-bottom: var(--app-3);
+}
+
+.wrap { flex-wrap: wrap; }
+.grow { flex: 1; }
+.top { align-items: flex-start; }
+.center { text-align: center; }
+.medium { font-weight: var(--font-weight-medium); }
+.full { width: 100%; justify-content: center; }
+
+/* A segmented control: buttons that share an edge. */
+.joined { display: flex; align-items: center; }
+.joined > * { border-radius: var(--app-radius-sm); }
+
+/* Shared page cards retain their semantic class names while using Tailwind's visual defaults. */
+:where(.panel, .stats, .editor, .alert) {
+  border-radius: var(--app-radius-lg);
+}
+
+/* ── Headings and figures ────────────────────────────────────────────────────
+ * The numbers are the content. Tightening their tracking and letting the label above them
+ * stay small and quiet is most of what makes a dense screen look composed rather than busy.
+ */
+.stats .stat-value,
+.stats [class*='value'] {
+  letter-spacing: -0.02em;
+}
+
+.page-title {
+  letter-spacing: -0.018em;
+}
+
+/* A label above a figure: small, quiet, and not competing with it. */
+.stat-label,
+.stats dt {
+  font-size: var(--app-text-xs);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--color-text-muted);
+}
+
+/* ── Segmented control ───────────────────────────────────────────────────── */
+/* A segmented control: one recessed track, with the selected segment riding on top of it as a
+   raised pill. The unselected segments are plain text on the track, so the choice is read from
+   the shape rather than from a colour. */
+.joined {
+  gap: 2px;
+  padding: 2px;
+  background: var(--app-fill);
+  border-radius: calc(var(--app-radius-sm) + 2px);
+}
+.joined > * {
+  box-shadow: none;
+  border: 0;
+  background: transparent;
+  color: var(--color-text-soft);
+}
+.joined > *:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--color-ink) 6%, transparent);
+  color: var(--color-text);
+}
+/* The selected segment is the one that is not a secondary button. */
+.joined > .btn:not(.btn--secondary):not(.btn--quiet),
+.joined > .btn:not(.btn--secondary):not(.btn--quiet):hover {
+  background: var(--app-surface);
+  color: var(--color-text);
+  font-weight: var(--font-weight-semibold);
+}
+.joined > * + * { border-left: 0; }
+
+/* ── Links ──────────────────────────────────────────────────────────────────
+ * In a table, underlining every link would draw a second set of rules across the rows. The
+ * underline arrives on hover instead, where it confirms what is about to be clicked.
+ */
+.table a:not(.btn) {
+  text-decoration: none;
+  text-underline-offset: var(--link-offset);
+}
+.table a:not(.btn):hover {
+  text-decoration: underline;
+  text-decoration-color: var(--color-accent);
+}
+
+.gap-1 { gap: var(--app-1); }
+.gap-2 { gap: var(--app-2); }
+.gap-3 { gap: var(--app-3); }
+
+.mt-1 { margin-top: var(--app-1); }
+.mt-2 { margin-top: var(--app-2); }
+.mt-3 { margin-top: var(--app-3); }
+.mt-5 { margin-top: var(--app-5); }
+.mb-2 { margin-bottom: var(--app-2); }
+.mb-3 { margin-bottom: var(--app-3); }
+.mb-4 { margin-bottom: var(--app-4); }
+.ml-2 { margin-left: var(--app-2); }
+.my-2 { margin-block: var(--app-2); }
+
+.empty { padding: var(--app-6); text-align: center; }
+.empty--sm { padding: var(--app-5); text-align: center; }
+
+.w-auto { width: auto; }
+.w-xs { max-width: 6rem; }
+.w-sm { max-width: 10rem; }
+.w-md { max-width: 12rem; }
+.w-lg { max-width: 18rem; }
+.form-narrow { max-width: 34rem; }
+.form-mid { max-width: 32rem; }
+.prose-narrow { max-width: 48rem; }
